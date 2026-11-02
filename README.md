@@ -9,6 +9,8 @@ ARMSX2 is a free and open-source PlayStation 2 (PS2) emulator based on PCSX2. It
 
 This fork supplies `armsx2_libretro-macos-arm64.zip` and its SHA-256 checksum to [Romlin](https://github.com/romlin-emu/romlin). The `romlin` branch preserves the ARMSX2 emulator and PCSX2 credits; it adds automatic loading of PNG/DDS texture packs installed by Romlin at `<save directory>/textures/replacements/`. The save directory belongs to one game, so this layout omits the disc serial. When that directory is absent, the core keeps the usual `<system>/pcsx2/textures/<serial>/replacements/` layout and settings. These overrides are runtime only and do not rewrite shared INI settings.
 
+Texture replacements require the hardware renderer: use Vulkan in the macOS core. Other libretro builds can also use OpenGL where available. The Software renderer does not apply replacement packs.
+
 The [Romlin core release workflow](.github/workflows/romlin_release.yml) builds and publishes the core from this repository. Its asset names match Romlin’s downloader. Run `python3 tests/libretro-textures/check.py` for the focused folder/configuration regression check; macOS ARM64 CI performs the full core build. No BIOS or game images are distributed.
 
 ## Thank You
