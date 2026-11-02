@@ -1,3 +1,5 @@
+> This documentation is distributed with [Romlin’s ARMSX2 fork](https://github.com/romlin-emu/ARMSX2), derived from [RompEmu/ARMSX2](https://github.com/RompEmu/ARMSX2). Original project names, authors, and licenses are retained.
+
 # PCSX2
 
 PCSX2 is a Playstation 2 emulator for Windows, Linux and Mac.  The project has been going since 2001 and still going strong, with contributions from many very clever developers over the years!  PCSX2 has compatibility upwards of 95% of the Playstation 2 library being playable.

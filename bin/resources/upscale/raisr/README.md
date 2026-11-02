@@ -1,3 +1,5 @@
+> This documentation is distributed with [Romlin’s ARMSX2 fork](https://github.com/romlin-emu/ARMSX2), derived from [RompEmu/ARMSX2](https://github.com/RompEmu/ARMSX2). Original project names, authors, and licenses are retained.
+
 # RAISR texture upscaler filters
 
 The filter set used by the RAISR texture upscaler (`pcsx2/GS/Renderers/HW/GSTextureUpscaler.cpp`).

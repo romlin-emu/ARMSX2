@@ -531,6 +531,10 @@ std::optional<TextureName> GSTextureReplacements::ParseReplacementName(const std
 
 std::string GSTextureReplacements::GetGameTextureDirectory()
 {
+#ifdef ENABLE_LIBRETRO
+	if (FileSystem::DirectoryExists(Path::Combine(EmuFolders::Textures, "replacements").c_str()))
+		return EmuFolders::Textures;
+#endif
 	return Path::Combine(EmuFolders::Textures, s_current_serial);
 }
 

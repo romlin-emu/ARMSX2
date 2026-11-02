@@ -1,25 +1,35 @@
-name: Romp core release
+name: Romlin core release
 
-# Builds the macOS arm64 libretro core that Romp downloads for PS2 games, and
+# Builds the macOS arm64 libretro core that Romlin downloads for PS2 games, and
 # publishes it as a release named after the commit it was built from.
 
 on:
   push:
-    branches: [romp]
+    branches: [romlin]
     paths-ignore:
-      - .github/workflows/romp_sync.yml
+      - .github/workflows/romlin_sync.yml
   workflow_dispatch:
 
 permissions: {}
 
 concurrency:
-  group: romp-release
+  group: romlin-release
   cancel-in-progress: false
 
 jobs:
+  check-textures:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 tests/libretro-textures/check.py
+
   macos:
     name: macOS arm64 core
-    uses: ./.github/workflows/macos_build_libretro.yml
+    uses: ./.github/workflows/macos_build_libretro.yml # zizmor: ignore[self-repository] standard local workflow reference
     permissions:
       contents: read
     with:
@@ -29,12 +39,12 @@ jobs:
 
   publish:
     name: Publish release
-    needs: macos
+    needs: [check-textures, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dl
           merge-multiple: true
@@ -55,5 +65,5 @@ jobs:
           gh release create "$tag" "$asset" "$asset.sha256" \
             --target "$GITHUB_SHA" \
             --title "ARMSX2 libretro core, ${GITHUB_SHA::10}" \
-            --notes "The ARMSX2 libretro core for Apple Silicon Macs, built from ${GITHUB_SHA::10} on the romp branch. It renders through the frontend's Vulkan device and links only system libraries." \
+            --notes "The ARMSX2 libretro core for Apple Silicon Macs, built from ${GITHUB_SHA::10} on the romlin branch. It renders through the frontend's Vulkan device and links only system libraries." \
             --latest

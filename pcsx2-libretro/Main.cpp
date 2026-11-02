@@ -275,6 +275,17 @@ void Host::CommitBaseSettingChanges()
 
 void Host::LoadSettings(SettingsInterface& si, std::unique_lock<std::mutex>& lock)
 {
+	const char* save_directory = nullptr;
+	if (!environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_directory) || !save_directory || !*save_directory)
+		return;
+
+	const std::string textures = Path::Combine(save_directory, "textures");
+	if (FileSystem::DirectoryExists(Path::Combine(textures, "replacements").c_str()))
+	{
+		// The frontend already separates saves by game; keep this override out of the shared INI.
+		EmuFolders::Textures = textures;
+		EmuConfig.GS.LoadTextureReplacements = true;
+	}
 }
 
 void Host::CheckForSettingsChanges(const Pcsx2Config& old_config)

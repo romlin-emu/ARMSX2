@@ -1,3 +1,5 @@
+> This documentation is distributed with [Romlin’s ARMSX2 fork](https://github.com/romlin-emu/ARMSX2), derived from [RompEmu/ARMSX2](https://github.com/RompEmu/ARMSX2). Original project names, authors, and licenses are retained.
+
 # ARMSX2 
 PlayStation 2 Emulator for Android based on the work of [PCSX2](https://github.com/PCSX2/pcsx2)
 

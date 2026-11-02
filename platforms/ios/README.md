@@ -1,3 +1,5 @@
+> This documentation is distributed with [Romlin’s ARMSX2 fork](https://github.com/romlin-emu/ARMSX2), derived from [RompEmu/ARMSX2](https://github.com/RompEmu/ARMSX2). Original project names, authors, and licenses are retained.
+
 <div align="center">
 
 ![ARMSX2](app_icons/icon.png)

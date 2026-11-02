@@ -1,7 +1,15 @@
+> This documentation is distributed with [Romlin’s ARMSX2 fork](https://github.com/romlin-emu/ARMSX2), derived from [RompEmu/ARMSX2](https://github.com/RompEmu/ARMSX2). Original project names, authors, and licenses are retained.
+
 # ARMSX2 — Native ARM64 JIT Fork of PCSX2
 [![All Platforms](https://img.shields.io/github/actions/workflow/status/ARMSX2/ARMSX2/build-all.yml?branch=master&label=All%20Platforms)](https://github.com/ARMSX2/ARMSX2/actions/workflows/build-all.yml)
 
 ARMSX2 is a free and open-source PlayStation 2 (PS2) emulator based on PCSX2. Its purpose is to emulate the PS2's hardware, using a combination of MIPS CPU [Interpreters](<https://en.wikipedia.org/wiki/Interpreter_(computing)>), [Recompilers](https://en.wikipedia.org/wiki/Dynamic_recompilation) and a [Virtual Machine](https://en.wikipedia.org/wiki/Virtual_machine) which manages hardware states and PS2 system memory. This allows you to play PS2 games on your phone, PC, or gaming handheld, with many additional features and benefits.
+
+## Romlin libretro distribution
+
+This fork supplies `armsx2_libretro-macos-arm64.zip` and its SHA-256 checksum to [Romlin](https://github.com/romlin-emu/romlin). The `romlin` branch preserves the ARMSX2 emulator and PCSX2 credits; it adds automatic loading of PNG/DDS texture packs installed by Romlin at `<save directory>/textures/replacements/`. The save directory belongs to one game, so this layout omits the disc serial. When that directory is absent, the core keeps the usual `<system>/pcsx2/textures/<serial>/replacements/` layout and settings. These overrides are runtime only and do not rewrite shared INI settings.
+
+The [Romlin core release workflow](.github/workflows/romlin_release.yml) builds and publishes the core from this repository. Its asset names match Romlin’s downloader. Run `python3 tests/libretro-textures/check.py` for the focused folder/configuration regression check; macOS ARM64 CI performs the full core build. No BIOS or game images are distributed.
 
 ## Thank You
 
