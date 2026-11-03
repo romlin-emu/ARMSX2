@@ -13,6 +13,12 @@ Texture replacements require the hardware renderer: use Vulkan in the macOS core
 
 The [Romlin core release workflow](.github/workflows/romlin_release.yml) builds and publishes the core from this repository. Its asset names match Romlin’s downloader. Run `python3 tests/libretro-textures/check.py` for the focused folder/configuration regression check; macOS ARM64 CI performs the full core build. No BIOS or game images are distributed.
 
+Pull requests targeting `romlin` run the texture regression check, release-script checks (`python3 tests/workflows/check.py`), and the same macOS ARM64 core builder used for releases, including its system-library and signature checks. Only push/manual runs on `refs/heads/romlin` in `romlin-emu/ARMSX2` can publish. The publisher selects the macOS core artifact and requires exactly one ZIP; asset names and SHA-256 files stay unchanged.
+
+The inherited Build All Platforms workflow remains automatic for pull requests and pushes to `master`, and can be run manually, with all desktop, SDL, libretro, Android and iOS jobs retained. Desktop guardrails remain blocking. Nightly and stable publication retain their upstream-only guards. Build jobs have read-only repository access; release publication/pruning alone gets write access. The upstream-sync checkout still retains its dedicated push token.
+
+Compiler caches start at 1 GB; use the `ccache -s` logs to tune their size. Qt and libretro caches remain separate, and macOS dependency keys include the selected Xcode version/build and dependency configuration. Platform builds require their native runners and dependencies.
+
 ## Thank You
 
 The ARMSX2 team is eternally indebted to the [PCSX2 project](https://pcsx2.net) it is based on. We are so fortunate to build on their 20 years of hardcore development.

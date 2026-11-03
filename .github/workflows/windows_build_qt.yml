@@ -47,6 +47,9 @@ on:
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
 jobs:
   build_windows_qt_arm64:
     name: ${{ inputs.jobName }}
@@ -59,7 +62,9 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # actions/checkout elides tags, fetch them primarily for releases
       - name: Fetch Tags
@@ -104,13 +109,15 @@ jobs:
 
       - name: Download patches
         shell: cmd
+        env:
+          PATCHES_URL: ${{ inputs.patchesUrl }}
         run: |
           cd bin/resources
-          curl -L -o patches.zip "${{ inputs.patchesUrl }}/patches.zip"
+          curl -L -o patches.zip "%PATCHES_URL%/patches.zip"
 
       - name: Cache Dependencies
         id: cache-deps
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: deps-arm64
           key: ${{ inputs.os }} arm64 deps ${{ hashFiles('.github/workflows/scripts/windows/build-dependencies-arm64.bat', '.github/workflows/scripts/windows/*.patch', '.github/workflows/scripts/common/*.patch') }}
@@ -124,6 +131,8 @@ jobs:
       - name: Generate CMake
         id: cmake
         shell: cmd
+        env:
+          CONFIGURATION: ${{ inputs.configuration }}
         run: |
           call "%VCVARSPATH%" || exit /b
           cmake . -B build ^
@@ -131,21 +140,23 @@ jobs:
             "-DCMAKE_CXX_COMPILER=%CLANGCL:\=/%" ^
             "-DCMAKE_PREFIX_PATH=%cd%\deps-arm64" ^
             -DQT_BUILD=ON ^
-            -DCMAKE_BUILD_TYPE=${{ inputs.configuration }} ^
+            -DCMAKE_BUILD_TYPE=%CONFIGURATION% ^
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF ^
             -G Ninja || exit /b
 
       - name: Build PCSX2
         shell: cmd
+        env:
+          CONFIGURATION: ${{ inputs.configuration }}
         run: |
           call "%VCVARSPATH%" || exit /b
-          cmake --build build --config ${{ inputs.configuration }} || exit /b
-          cmake --install build --config ${{ inputs.configuration }} || exit /b
+          cmake --build build --config %CONFIGURATION% || exit /b
+          cmake --install build --config %CONFIGURATION% || exit /b
           REM We can use Segoe UI Emoji so we don't need to bundle this
           del bin\resources\fonts\Twemoji*
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.artifact-metadata.outputs.artifact-name }}
           path: |

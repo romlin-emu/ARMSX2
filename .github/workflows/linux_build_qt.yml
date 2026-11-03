@@ -32,6 +32,7 @@ on:
         type: string
         default: https://github.com/isztldav/pcsx2_patches/releases/latest/download
       fetchTags:
+        description: Compatibility input; full-history checkout always includes tags.
         required: false
         type: boolean
         default: false
@@ -44,6 +45,9 @@ on:
         type: string
         default: Release
 
+permissions:
+  contents: read
+
 jobs:
   build_linux:
     name: ${{ inputs.jobName }}
@@ -55,18 +59,14 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_COMPRESS: true
       CCACHE_COMPRESSLEVEL: 9
-      CCACHE_MAXSIZE: 100M
+      CCACHE_MAXSIZE: 1G
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-           fetch-depth: 0
-
-      # actions/checkout elides tags, fetch them primarily for releases
-      - name: Fetch Tags
-        if: ${{ inputs.fetchTags }}
-        run: git fetch --tags --no-recurse-submodules
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Add stable release identifier file
         if: ${{ inputs.stableBuild == true || inputs.stableBuild == 'true' }}
@@ -89,10 +89,10 @@ jobs:
       # -- SETUP CCACHE - https://cristianadam.eu/20200113/speeding-up-c-plus-plus-github-actions-using-ccache/
       - name: Prepare ccache timestamp
         id: ccache_cache_timestamp
-        run: echo "timestamp=$(date -u "+%Y-%m-%d-%H;%M;%S")" >> $GITHUB_OUTPUT
+        run: echo "timestamp=$(date -u "+%Y-%m-%d-%H;%M;%S")" >> "$GITHUB_OUTPUT"
 
       - name: ccache cache files
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ccache
           key: ${{ inputs.os }} ${{ inputs.platform }} ${{ inputs.compiler }} ${{ inputs.cmakeBuildType }} ccache ${{ steps.ccache_cache_timestamp.outputs.timestamp }}
@@ -104,7 +104,7 @@ jobs:
           sudo tools/retry.sh apt-add-repository -n 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-17 main'
           sudo tools/retry.sh apt-get -o Acquire::ForceIPv4=true update
           sudo tools/retry.sh apt-get -y install \
-            build-essential ccache clang-17 cmake curl extra-cmake-modules git libasound2-dev libaio-dev \
+            aria2 build-essential ccache clang-17 cmake curl extra-cmake-modules git libasound2-dev libaio-dev \
             libcurl4-openssl-dev libdbus-1-dev libdecor-0-dev libegl-dev libevdev-dev libfontconfig-dev libfreetype-dev libfuse2 libgtk-3-dev libgudev-1.0-dev \
             libharfbuzz-dev libinput-dev libopengl-dev libopus-dev libpcap-dev libpipewire-0.3-dev libpulse-dev libssl-dev libudev-dev libva-dev \
             libwayland-dev libx11-dev libx11-xcb-dev libx264-dev libxcb1-dev libxcb-composite0-dev libxcb-cursor-dev libxcb-damage0-dev libxcb-glx0-dev libxcb-icccm4-dev \
@@ -114,7 +114,7 @@ jobs:
 
       - name: Cache Dependencies
         id: cache-deps
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/deps
           key: ${{ inputs.os }} ${{ inputs.platform }} deps ${{ hashFiles('.github/workflows/scripts/linux/build-dependencies-qt.sh', '.github/workflows/scripts/common/*.patch') }}
@@ -124,17 +124,23 @@ jobs:
         run: .github/workflows/scripts/linux/build-dependencies-qt.sh "$HOME/deps"
 
       - name: Download patches
+        env:
+          PATCHES_URL: ${{ inputs.patchesUrl }}
         run: |
           cd bin/resources
-          aria2c -Z "${{ inputs.patchesUrl }}/patches.zip"
+          aria2c -Z "$PATCHES_URL/patches.zip"
 
       - name: Generate CMake
         env:
           ADDITIONAL_CMAKE_ARGS: ${{ inputs.cmakeflags }}
+          CMAKE_BUILD_TYPE_INPUT: ${{ inputs.cmakeBuildType }}
+          CMAKE_IPO: ${{ case(inputs.cmakeBuildType == 'Debug', 'OFF', 'ON') }}
         run: |
+          # cmakeflags is an intentional whitespace-separated argument list.
+          # shellcheck disable=SC2086
           cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE="${{ inputs.cmakeBuildType }}" \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=${{ case(inputs.cmakeBuildType == 'Debug', 'OFF', 'ON') }} \
+            -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE_INPUT" \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION="$CMAKE_IPO" \
             -DCMAKE_PREFIX_PATH="$HOME/deps" \
             -DCMAKE_C_COMPILER=clang-17 \
             -DCMAKE_CXX_COMPILER=clang++-17 \
@@ -179,7 +185,7 @@ jobs:
 
       - name: Upload artifact
         if: inputs.buildAppImage == true
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.artifact-metadata.outputs.artifact-name }}
           path: ci-artifacts

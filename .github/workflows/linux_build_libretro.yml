@@ -25,9 +25,13 @@ on:
         type: string
         default: arm64
       fetchTags:
+        description: Compatibility input; full-history checkout always includes tags.
         required: false
         type: boolean
         default: false
+
+permissions:
+  contents: read
 
 jobs:
   build_libretro:
@@ -39,17 +43,14 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_COMPRESS: true
       CCACHE_COMPRESSLEVEL: 9
-      CCACHE_MAXSIZE: 100M
+      CCACHE_MAXSIZE: 1G
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
-
-      - name: Fetch Tags
-        if: ${{ inputs.fetchTags }}
-        run: git fetch --tags --no-recurse-submodules
 
       - name: Prepare Artifact Metadata
         id: artifact-metadata
@@ -64,10 +65,10 @@ jobs:
 
       - name: Prepare ccache timestamp
         id: ccache_cache_timestamp
-        run: echo "timestamp=$(date -u "+%Y-%m-%d-%H;%M;%S")" >> $GITHUB_OUTPUT
+        run: echo "timestamp=$(date -u "+%Y-%m-%d-%H;%M;%S")" >> "$GITHUB_OUTPUT"
 
       - name: ccache cache files
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ccache
           key: ${{ inputs.os }} ${{ inputs.platform }} libretro ccache ${{ steps.ccache_cache_timestamp.outputs.timestamp }}
@@ -86,7 +87,7 @@ jobs:
 
       - name: Cache Dependencies
         id: cache-deps
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/deps
           # Still shares the SDL job's cache: both ask that script for a static
@@ -155,7 +156,7 @@ jobs:
           mv "${NAME}.tar.zst" "$GITHUB_WORKSPACE"/ci-artifacts/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.artifact-metadata.outputs.artifact-name }}
           path: ci-artifacts
