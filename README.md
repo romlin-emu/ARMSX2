@@ -11,13 +11,11 @@ This fork supplies `armsx2_libretro-macos-arm64.zip` and its SHA-256 checksum to
 
 Texture replacements require the hardware renderer: use Vulkan in the macOS core. Other libretro builds can also use OpenGL where available. The Software renderer does not apply replacement packs.
 
-The [Romlin core release workflow](.github/workflows/romlin_release.yml) builds and publishes the core from this repository. Its asset names match Romlin’s downloader. Run `python3 tests/libretro-textures/check.py` for the focused folder/configuration regression check; macOS ARM64 CI performs the full core build. No BIOS or game images are distributed.
+This repository builds and publishes one product: the macOS arm64 libretro core. The [Romlin core release workflow](.github/workflows/romlin_release.yml) builds it with [`macos_build_libretro.yml`](.github/workflows/macos_build_libretro.yml) and publishes it as `armsx2_libretro-macos-arm64.zip` plus a `.sha256` file on a `core-YYYYMMDD-<commit>` release; these names match Romlin's downloader. No BIOS or game images are distributed.
 
-Pull requests targeting `romlin` run the texture regression check, release-script checks (`python3 tests/workflows/check.py`), and the same macOS ARM64 core builder used for releases, including its system-library and signature checks. Only push/manual runs on `refs/heads/romlin` in `romlin-emu/ARMSX2` can publish. The publisher selects the macOS core artifact and requires exactly one ZIP; asset names and SHA-256 files stay unchanged.
+Pull requests to `romlin` and pushes to it run the texture regression check (`python3 tests/libretro-textures/check.py`), the release-script checks (`python3 tests/workflows/check.py`) and the full core build, including its system-library and signature checks. Only pushes and manual runs on `romlin` in `romlin-emu/ARMSX2` publish a release, and only if exactly one core ZIP was built.
 
-The inherited Build All Platforms workflow remains automatic for pull requests and pushes to `master`, and can be run manually, with all desktop, SDL, libretro, Android and iOS jobs retained. Desktop guardrails remain blocking. Nightly and stable publication retain their upstream-only guards. Build jobs have read-only repository access; release publication/pruning alone gets write access. The upstream-sync checkout still retains its dedicated push token.
-
-Compiler caches start at 1 GB; use the `ccache -s` logs to tune their size. Qt and libretro caches remain separate, and macOS dependency keys include the selected Xcode version/build and dependency configuration. Platform builds require their native runners and dependencies.
+This repository no longer syncs from upstream, and the inherited desktop, SDL, Android, iOS, Linux, Windows and nightly workflows have been removed. Only pushes to `romlin` save the compiler cache; pull requests restore it.
 
 ## Thank You
 

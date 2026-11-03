@@ -95,8 +95,10 @@ jobs:
         id: ccache_cache_timestamp
         run: echo "timestamp=$(date -u "+%Y-%m-%d-%H;%M;%S")" >> "$GITHUB_OUTPUT"
 
-      - name: ccache cache files
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      # Every run restores the newest compiler cache; only pushes to romlin save
+      # one, so pull requests do not churn the repository's cache quota.
+      - name: Restore ccache files
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ccache
           key: ${{ inputs.os }} arm64 libretro ccache ${{ steps.ccache_cache_timestamp.outputs.timestamp }}
@@ -107,9 +109,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/deps
-          # Its own cache, not the Qt job's: that one is a shared, universal
-          # prefix from build-dependencies-universal.sh, this is a static arm64
-          # one without Qt, ffmpeg or MoltenVK.
+          # Its own cache: a static arm64 set without Qt, ffmpeg or MoltenVK.
           key: ${{ inputs.os }} arm64 Xcode-${{ steps.xcode.outputs.version }} Release static-noqt-noffmpeg-macos11-deps ${{ hashFiles('.github/workflows/scripts/macos/build-dependencies-slice.sh', '.github/workflows/scripts/common/*.patch') }}
 
       - name: Build Dependencies
@@ -144,12 +144,21 @@ jobs:
             -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
 
       - name: Build armsx2_libretro
+        id: build
         working-directory: build
         run: |
           ccache -p
           ccache -z
           ninja pcsx2-libretro
           ccache -s
+
+      # Also after a failed build: the objects it did compile make the retry fast.
+      - name: Save ccache files
+        if: ${{ !cancelled() && steps.build.outcome != 'skipped' && github.ref == 'refs/heads/romlin' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .ccache
+          key: ${{ inputs.os }} arm64 libretro ccache ${{ steps.ccache_cache_timestamp.outputs.timestamp }}
 
       - name: Check the core is self-contained
         run: |

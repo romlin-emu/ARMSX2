@@ -6,8 +6,6 @@ name: Romlin core release
 on:
   push:
     branches: [romlin]
-    paths-ignore:
-      - .github/workflows/romlin_sync.yml
   pull_request:
     branches: [romlin]
   workflow_dispatch:
