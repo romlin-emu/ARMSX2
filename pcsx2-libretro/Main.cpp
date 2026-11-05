@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "libretro.h"
+#include "InputDevices.h"
 
 // libretro_vulkan.h pulls in vulkan.h, which only declares a platform's surface
 // types when that platform's VK_USE_PLATFORM_* macro is already defined. The
@@ -95,6 +96,8 @@
 #include "pcsx2/SPU2/spu2.h"
 #include "pcsx2/Host/AudioStream.h"
 #include "pcsx2/VMManager.h"
+#include "pcsx2/USB/USB.h"
+#include "pcsx2/USB/qemu-usb/hid.h"
 
 #include "svnrev.h"
 
@@ -102,6 +105,8 @@
 // libretro callbacks + core state
 //////////////////////////////////////////////////////////////////////////
 
+static LibretroInput::InputDevices s_input_devices;
+static std::array<unsigned, LibretroInput::NUM_PORTS> s_applied_devices{};
 static retro_environment_t environ_cb;
 static retro_video_refresh_t video_cb;
 static retro_audio_sample_t audio_sample_cb;
@@ -239,6 +244,14 @@ bool LibretroCore::InitializeConfig()
 		s_base_settings->SetIntValue("EmuCore/GS", "Renderer",
 			static_cast<int>(GSRendererType::VK));
 		s_base_settings->SetBoolValue("InputSources", "SDL", false);
+		const auto input = s_input_devices.Take();
+		for (unsigned port = 0; port < input.size(); port++)
+		{
+			const auto& state = input[port];
+			s_base_settings->SetStringValue(Pad::GetConfigSection(port).c_str(), "Type", state.HasPad() ? "DualShock2" : "None");
+			USB::SetConfigDevice(*s_base_settings, port, state.UsbTypeName());
+			s_applied_devices[port] = state.device;
+		}
 		// Audio goes out through retro_run pulling the stream ring; the Null
 		// backend keeps SPU2 mixing into the ring with no device thread.
 		s_base_settings->SetStringValue("SPU2/Output", "Backend", "Null");
@@ -490,12 +503,96 @@ void LibretroCore::DrainCPUThreadQueue()
 	}
 }
 
+static void ApplyInputSnapshot()
+{
+	const auto input = s_input_devices.Take();
+	bool changed = false;
+	{
+		auto lock = Host::GetSettingsLock();
+		for (unsigned port = 0; port < input.size(); port++)
+		{
+			const auto& state = input[port];
+			if (s_applied_devices[port] == state.device)
+				continue;
+			s_base_settings->SetStringValue(Pad::GetConfigSection(port).c_str(), "Type", state.HasPad() ? "DualShock2" : "None");
+			USB::SetConfigDevice(*s_base_settings, port, state.UsbTypeName());
+			s_applied_devices[port] = state.device;
+			changed = true;
+		}
+	}
+	if (changed)
+		VMManager::ApplySettings();
+	for (unsigned port = 0; port < input.size(); port++)
+	{
+		const auto& state = input[port];
+		if (PadBase* pad = state.HasPad() ? Pad::GetPad(port) : nullptr)
+		{
+			static constexpr struct
+			{
+				unsigned retro;
+				u32 ds2;
+			} bmap[] = {
+				{RETRO_DEVICE_ID_JOYPAD_UP, PadDualshock2::Inputs::PAD_UP},
+				{RETRO_DEVICE_ID_JOYPAD_RIGHT, PadDualshock2::Inputs::PAD_RIGHT},
+				{RETRO_DEVICE_ID_JOYPAD_DOWN, PadDualshock2::Inputs::PAD_DOWN},
+				{RETRO_DEVICE_ID_JOYPAD_LEFT, PadDualshock2::Inputs::PAD_LEFT},
+				{RETRO_DEVICE_ID_JOYPAD_X, PadDualshock2::Inputs::PAD_TRIANGLE},
+				{RETRO_DEVICE_ID_JOYPAD_A, PadDualshock2::Inputs::PAD_CIRCLE},
+				{RETRO_DEVICE_ID_JOYPAD_B, PadDualshock2::Inputs::PAD_CROSS},
+				{RETRO_DEVICE_ID_JOYPAD_Y, PadDualshock2::Inputs::PAD_SQUARE},
+				{RETRO_DEVICE_ID_JOYPAD_SELECT, PadDualshock2::Inputs::PAD_SELECT},
+				{RETRO_DEVICE_ID_JOYPAD_START, PadDualshock2::Inputs::PAD_START},
+				{RETRO_DEVICE_ID_JOYPAD_L, PadDualshock2::Inputs::PAD_L1},
+				{RETRO_DEVICE_ID_JOYPAD_L2, PadDualshock2::Inputs::PAD_L2},
+				{RETRO_DEVICE_ID_JOYPAD_R, PadDualshock2::Inputs::PAD_R1},
+				{RETRO_DEVICE_ID_JOYPAD_R2, PadDualshock2::Inputs::PAD_R2},
+				{RETRO_DEVICE_ID_JOYPAD_L3, PadDualshock2::Inputs::PAD_L3},
+				{RETRO_DEVICE_ID_JOYPAD_R3, PadDualshock2::Inputs::PAD_R3},
+			};
+			for (const auto& m : bmap)
+				pad->Set(m.ds2, state.joypad[m.retro] ? 1.0f : 0.0f);
+
+			// Analog sticks: split each axis into the two directional slots.
+			const auto axis = [](s16 v, bool positive) {
+				const float f = std::clamp(static_cast<float>(v) / 32767.0f, -1.0f, 1.0f);
+				return positive ? std::max(f, 0.0f) : std::max(-f, 0.0f);
+			};
+			const s16 lx = state.analog[0];
+			const s16 ly = state.analog[1];
+			const s16 rx = state.analog[2];
+			const s16 ry = state.analog[3];
+			pad->Set(PadDualshock2::Inputs::PAD_L_RIGHT, axis(lx, true));
+			pad->Set(PadDualshock2::Inputs::PAD_L_LEFT, axis(lx, false));
+			pad->Set(PadDualshock2::Inputs::PAD_L_DOWN, axis(ly, true));
+			pad->Set(PadDualshock2::Inputs::PAD_L_UP, axis(ly, false));
+			pad->Set(PadDualshock2::Inputs::PAD_R_RIGHT, axis(rx, true));
+			pad->Set(PadDualshock2::Inputs::PAD_R_LEFT, axis(rx, false));
+			pad->Set(PadDualshock2::Inputs::PAD_R_DOWN, axis(ry, true));
+			pad->Set(PadDualshock2::Inputs::PAD_R_UP, axis(ry, false));
+		}
+		if (state.HasMouse())
+		{
+			constexpr unsigned buttons[] = {INPUT_BUTTON_LEFT, INPUT_BUTTON_RIGHT, INPUT_BUTTON_MIDDLE};
+			for (unsigned i = 0; i < state.mouse_buttons.size(); i++)
+				USB::SetDeviceBindValue(port, buttons[i], state.mouse_buttons[i] ? 1.0f : 0.0f);
+			if (state.mouse_x != 0)
+				USB::SetDeviceBindValue(port, INPUT_BUTTON__MAX + static_cast<unsigned>(InputPointerAxis::X), static_cast<float>(state.mouse_x));
+			if (state.mouse_y != 0)
+				USB::SetDeviceBindValue(port, INPUT_BUTTON__MAX + static_cast<unsigned>(InputPointerAxis::Y), static_cast<float>(state.mouse_y));
+			if (state.mouse_wheel != 0)
+				USB::SetDeviceBindValue(port, INPUT_BUTTON__MAX + static_cast<unsigned>(InputPointerAxis::WheelY), static_cast<float>(state.mouse_wheel));
+		}
+	}
+}
+
 void Host::PumpMessagesOnCPUThread()
 {
 	if (s_shutdown_requested.load(std::memory_order_acquire) && VMManager::HasValidVM())
 		VMManager::SetState(VMState::Stopping);
 
 	LibretroCore::DrainCPUThreadQueue();
+	if (VMManager::HasValidVM())
+		ApplyInputSnapshot();
 }
 
 void Host::RunOnCPUThread(std::function<void()> function, bool block)
@@ -1663,6 +1760,11 @@ static void InstallFrontendVFS(retro_environment_t cb)
 RETRO_API void retro_set_environment(retro_environment_t cb)
 {
 	environ_cb = cb;
+	static const retro_controller_description choices[] = {
+		{"None", RETRO_DEVICE_NONE}, {"DualShock 2", RETRO_DEVICE_JOYPAD}, {"USB Mouse", RETRO_DEVICE_MOUSE},
+	};
+	static const retro_controller_info ports[] = {{choices, 3}, {choices, 3}, {nullptr, 0}};
+	cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, const_cast<retro_controller_info*>(ports));
 
 	struct retro_log_callback log_iface;
 	if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log_iface))
@@ -1748,6 +1850,8 @@ RETRO_API void retro_init(void)
 
 RETRO_API void retro_deinit(void)
 {
+	s_input_devices.Reset();
+	s_applied_devices = {};
 	LibretroCore::s_frame_buffer.clear();
 	LibretroCore::s_frame_buffer.shrink_to_fit();
 }
@@ -1780,6 +1884,10 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info* info)
 
 RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
 {
+	if (port >= LibretroInput::NUM_PORTS)
+		return;
+	if (!s_input_devices.Select(port, device) && log_cb)
+		log_cb(RETRO_LOG_WARN, "Unsupported input device %u on port %u.\n", device, port);
 }
 
 RETRO_API void retro_reset(void)
@@ -2126,6 +2234,8 @@ RETRO_API void retro_unload_game(void)
 	if (LibretroCore::s_cpu_thread.joinable())
 		LibretroCore::s_cpu_thread.join();
 
+	s_input_devices.Reset();
+	s_applied_devices = {};
 	s_base_settings.reset();
 	s_secrets_settings.reset();
 	LibretroCore::s_content_path.clear();
@@ -2147,62 +2257,11 @@ RETRO_API void retro_unload_game(void)
 RETRO_API void retro_run(void)
 {
 	input_poll_cb();
+	s_input_devices.Capture(input_state_cb);
 
 	bool options_updated = false;
 	if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &options_updated) && options_updated)
 		ApplyCoreOptions(false);
-
-	// M3 input: forward the libretro joypad straight into the DualShock2
-	// bind slots (bypasses InputManager entirely).
-	if (VMManager::HasValidVM())
-	{
-		if (PadBase* pad = Pad::GetPad(0))
-		{
-			static constexpr struct
-			{
-				unsigned retro;
-				u32 ds2;
-			} bmap[] = {
-				{RETRO_DEVICE_ID_JOYPAD_UP, PadDualshock2::Inputs::PAD_UP},
-				{RETRO_DEVICE_ID_JOYPAD_RIGHT, PadDualshock2::Inputs::PAD_RIGHT},
-				{RETRO_DEVICE_ID_JOYPAD_DOWN, PadDualshock2::Inputs::PAD_DOWN},
-				{RETRO_DEVICE_ID_JOYPAD_LEFT, PadDualshock2::Inputs::PAD_LEFT},
-				{RETRO_DEVICE_ID_JOYPAD_X, PadDualshock2::Inputs::PAD_TRIANGLE},
-				{RETRO_DEVICE_ID_JOYPAD_A, PadDualshock2::Inputs::PAD_CIRCLE},
-				{RETRO_DEVICE_ID_JOYPAD_B, PadDualshock2::Inputs::PAD_CROSS},
-				{RETRO_DEVICE_ID_JOYPAD_Y, PadDualshock2::Inputs::PAD_SQUARE},
-				{RETRO_DEVICE_ID_JOYPAD_SELECT, PadDualshock2::Inputs::PAD_SELECT},
-				{RETRO_DEVICE_ID_JOYPAD_START, PadDualshock2::Inputs::PAD_START},
-				{RETRO_DEVICE_ID_JOYPAD_L, PadDualshock2::Inputs::PAD_L1},
-				{RETRO_DEVICE_ID_JOYPAD_L2, PadDualshock2::Inputs::PAD_L2},
-				{RETRO_DEVICE_ID_JOYPAD_R, PadDualshock2::Inputs::PAD_R1},
-				{RETRO_DEVICE_ID_JOYPAD_R2, PadDualshock2::Inputs::PAD_R2},
-				{RETRO_DEVICE_ID_JOYPAD_L3, PadDualshock2::Inputs::PAD_L3},
-				{RETRO_DEVICE_ID_JOYPAD_R3, PadDualshock2::Inputs::PAD_R3},
-			};
-			for (const auto& m : bmap)
-				pad->Set(m.ds2, input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, m.retro) ? 1.0f : 0.0f);
-
-			// Analog sticks: split each axis into the two directional slots.
-			const auto axis = [](s16 v, bool positive) {
-				const float f = std::clamp(static_cast<float>(v) / 32767.0f, -1.0f, 1.0f);
-				return positive ? std::max(f, 0.0f) : std::max(-f, 0.0f);
-			};
-			const s16 lx = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
-			const s16 ly = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
-			const s16 rx = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
-			const s16 ry = input_state_cb(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
-			pad->Set(PadDualshock2::Inputs::PAD_L_RIGHT, axis(lx, true));
-			pad->Set(PadDualshock2::Inputs::PAD_L_LEFT, axis(lx, false));
-			pad->Set(PadDualshock2::Inputs::PAD_L_DOWN, axis(ly, true));
-			pad->Set(PadDualshock2::Inputs::PAD_L_UP, axis(ly, false));
-			pad->Set(PadDualshock2::Inputs::PAD_R_RIGHT, axis(rx, true));
-			pad->Set(PadDualshock2::Inputs::PAD_R_LEFT, axis(rx, false));
-			pad->Set(PadDualshock2::Inputs::PAD_R_DOWN, axis(ry, true));
-			pad->Set(PadDualshock2::Inputs::PAD_R_UP, axis(ry, false));
-		}
-	}
-
 #ifdef ENABLE_VULKAN
 	if (LibretroCore::s_hw_render_vulkan)
 	{
