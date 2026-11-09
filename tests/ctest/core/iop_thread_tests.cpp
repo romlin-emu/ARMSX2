@@ -2869,4 +2869,162 @@ namespace
 		EXPECT_EQ(stats.lag_spins_parked, 0u) << "the IOP was awake, watching the watermark";
 		EXPECT_EQ(stats.lag_spins_idle, 1u);
 	}
+	// ---- the lag rules (IopLagRules.h) at the thread object
+
+	// A Lockstep skew of a frame keeps the IOP a frame behind. With the idle-outstanding rule, an idle event test after the EE sent a
+	// request brings the IOP to within the tight bound, and a reply from the IOP lets the skew grow back.
+	TEST_F(IopThreadObjectLockstep, AnIdleEventTestWithARequestOutAndASkewKeepsTheIopWithinTheTightBound)
+	{
+		constexpr s64 kSkew = 400000;
+		constexpr s32 kTightBound = 8192;
+		Params p = BaseParams(IopThreadMode::Lockstep);
+		p.lockstep_skew = kSkew;
+		p.rules.mask = LagRule::Bit(LagRule::IdleOutstanding);
+		p.rules.tight = kTightBound;
+		p.rules.outstanding_max_age = 10'000'000;
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+
+		u64 cycle = 0;
+		const auto event_test = [&](bool idle) {
+			cycle += 3072;
+			ee_cycle = cycle;
+			thread->NoteEventTest(cycle, idle ? FastForward::WaitLoop : 0, 100);
+			return thread->LockstepRunSlice(cycle);
+		};
+
+		// No request out: the IOP stays a skew behind, idle or not.
+		for (int i = 0; i < 200; i++)
+			event_test(i % 2 == 0);
+		s64 behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_GE(behind, kSkew - fake.block);
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kSkew);
+
+		// A request goes out. A busy event test keeps the skew; the first idle one brings the IOP up to the tight bound.
+		thread->NoteEeSifStart(cycle, 1);
+		event_test(false);
+		EXPECT_GE(static_cast<s64>(cycle - thread->PublishedPos()), kSkew - fake.block);
+		event_test(true);
+		behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_LE(behind, kTightBound);
+		EXPECT_GE(behind, kTightBound - fake.block);
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kTightBound);
+
+		// The reply arrives: the next idle event test is loose again, and the skew grows back as the EE runs on.
+		thread->NoteIopSif0Reply(cycle);
+		for (int i = 0; i < 200; i++)
+			event_test(true);
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kSkew);
+		behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_GE(behind, kSkew - fake.block);
+		EXPECT_LE(behind, kSkew);
+		EXPECT_EQ(thread->Rules().Stats().activations[LagRule::IdleOutstanding], 1u);
+	}
+
+	TEST_F(IopThreadObjectLockstep, WithNoRuleOnARequestChangesNothingUnderASkew)
+	{
+		constexpr s64 kSkew = 400000;
+		Params p = BaseParams(IopThreadMode::Lockstep);
+		p.lockstep_skew = kSkew;
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		u64 cycle = 0;
+		for (int i = 0; i < 300; i++)
+		{
+			cycle += 3072;
+			ee_cycle = cycle;
+			if (i == 150)
+				thread->NoteEeSifStart(cycle, 1);
+			thread->NoteEventTest(cycle, FastForward::WaitLoop, 100);
+			thread->LockstepRunSlice(cycle);
+			EXPECT_EQ(thread->LockstepSkewCurrent(), kSkew);
+		}
+		const s64 behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_GE(behind, kSkew - fake.block);
+		EXPECT_LE(behind, kSkew);
+	}
+
+	// Threaded: the lag bound is a frame, the IOP is slow, and the EE has a request out and is idle. It may not run past the tight bound.
+	TEST_F(IopThreadObject, AnIdleEeWithARequestOutWaitsForTheIopWithinTheTightBoundAndABusyEeDoesNot)
+	{
+		constexpr s32 kLoose = 4915200;
+		constexpr s32 kTightBound = 8192;
+		Params p = BaseParams();
+		p.lag = kLoose;
+		p.rules.mask = LagRule::Bit(LagRule::IdleOutstanding);
+		p.rules.tight = kTightBound;
+		p.rules.outstanding_max_age = 100'000'000;
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+
+		// The IOP does not move until the EE is far ahead and a request is out: a gate in the first slice.
+		std::atomic<bool> release{false};
+		fake.in_slice_hook = [&](u64, u64) {
+			while (!release.load(std::memory_order_acquire) && !aborted.load(std::memory_order_relaxed))
+				std::this_thread::sleep_for(50us);
+		};
+		u64 cycle = 1'000'000;
+		Publish(cycle);
+		EXPECT_TRUE(thread->CheckLag(cycle)); // a busy EE a long way ahead: the loose bound
+		thread->NoteEventTest(cycle, 0, 100);
+		EXPECT_TRUE(thread->CheckLag(cycle));
+		EXPECT_EQ(thread->GetStats().lag_spins, 0u);
+
+		thread->NoteEeSifStart(cycle, 1);
+		cycle += 3072;
+		Publish(cycle);
+		thread->NoteEventTest(cycle, FastForward::WaitLoop, 100);
+		std::thread releaser([&] {
+			std::this_thread::sleep_for(20ms);
+			release.store(true, std::memory_order_release);
+		});
+		const auto begin = Clock::now();
+		EXPECT_TRUE(thread->CheckLag(cycle));
+		releaser.join();
+		EXPECT_GE(Clock::now() - begin, 15ms) << "the idle EE waited for the slow IOP";
+		EXPECT_LE(static_cast<s64>(cycle - thread->PublishedPos()), kTightBound);
+		EXPECT_EQ(thread->GetStats().lag_spins, 1u);
+	}
+	// SPU2 auto-DMA running on the IOP (the streams word the IOP thread samples at the end of each slice) holds a skewed IOP within the
+	// tight bound whatever the EE is doing, and lets the skew grow back when it stops.
+	TEST_F(IopThreadObjectLockstep, AnAutoDmaStreamKeepsASkewedIopWithinTheTightBoundUntilItStops)
+	{
+		constexpr s64 kSkew = 400000;
+		constexpr s32 kTightBound = 8192;
+		std::atomic<u32> streams{0};
+		Params p = BaseParams(IopThreadMode::Lockstep);
+		p.lockstep_skew = kSkew;
+		p.rules.mask = LagRule::Bit(LagRule::Stream);
+		p.rules.tight = kTightBound;
+		p.rules.stream_bits = StreamBit::SpuAdmaCore0;
+		p.sample_streams = [&] { return streams.load(); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+
+		u64 cycle = 0;
+		const auto event_test = [&] {
+			cycle += 3072;
+			ee_cycle = cycle;
+			thread->NoteEventTest(cycle, 0, 100); // a busy EE
+			thread->LockstepRunSlice(cycle);
+		};
+		for (int i = 0; i < 200; i++)
+			event_test();
+		EXPECT_GE(static_cast<s64>(cycle - thread->PublishedPos()), kSkew - fake.block);
+
+		// The stream starts: the IOP sees it at the end of its next slice, the EE at the event test after that.
+		streams.store(StreamBit::SpuAdmaCore0);
+		event_test();
+		event_test();
+		const s64 behind = static_cast<s64>(cycle - thread->PublishedPos());
+		EXPECT_LE(behind, kTightBound);
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kTightBound);
+
+		// A disc read is not in the stream bits.
+		streams.store(StreamBit::CdvdBusy);
+		for (int i = 0; i < 200; i++)
+			event_test();
+		EXPECT_EQ(thread->LockstepSkewCurrent(), kSkew);
+		EXPECT_GE(static_cast<s64>(cycle - thread->PublishedPos()), kSkew - fake.block);
+	}
 } // namespace
