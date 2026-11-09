@@ -1841,6 +1841,209 @@ namespace
 			EXPECT_EQ(received[i], i) << "the IOP-to-EE queue must keep its order";
 	}
 
+	TEST_F(IopThreadObject, AnI2EItemIsStampedWithTheIopsTimeWhenItWasProduced)
+	{
+		// The IOP's clock inside a slice is Params::iop_now. An item takes the time at the post, not the time it gets
+		// into the queue and not the time the EE takes it.
+		std::atomic<u64> clock{0};
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			clock.store(0x1'0000'1234ull);
+			thread->PostI2E(I2EKind::SbusIrq, 1);
+			clock.store(0x1'0000'5678ull);
+			thread->PostI2E(I2EKind::SbusIrq, 2);
+		};
+		std::vector<I2EItem> received;
+		Params p = BaseParams();
+		p.iop_now = [&] { return clock.load(); };
+		p.handle_i2e = [&](const I2EItem& item) { received.push_back(item); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		ASSERT_TRUE(WaitPos(100));
+		ASSERT_TRUE(WaitEe([&] {
+			if (thread->MayHaveI2E())
+				thread->DrainI2E();
+			return received.size() == 2;
+		}));
+		EXPECT_EQ(received[0].stamp, 0x1234u) << "the low 32 bits of the IOP's time";
+		EXPECT_EQ(received[1].stamp, 0x5678u);
+		const u64 now = 0x1'0000'9000ull; // the EE takes the item 0x9000 - 0x5678 cycles after it was produced, across the 2^32 wrap
+		EXPECT_EQ(static_cast<s32>(static_cast<u32>(now) - received[1].stamp), 0x9000 - 0x5678);
+	}
+
+	TEST_F(IopThreadObject, AnI2EItemWithNoIopClockIsStampedWithTheSliceStart)
+	{
+		fake.in_slice_hook = [&, once = false](u64 from, u64) mutable {
+			if (once || from == 0)
+				return;
+			once = true;
+			thread->PostI2E(I2EKind::SbusIrq, 9);
+		};
+		std::vector<I2EItem> received;
+		Params p = BaseParams();
+		p.handle_i2e = [&](const I2EItem& item) { received.push_back(item); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(640);
+		ASSERT_TRUE(WaitPos(640));
+		Publish(1280);
+		ASSERT_TRUE(WaitPos(1280));
+		ASSERT_TRUE(WaitEe([&] {
+			if (thread->MayHaveI2E())
+				thread->DrainI2E();
+			return received.size() == 1;
+		}));
+		EXPECT_EQ(received[0].stamp, 640u) << "no iop_now: the position at the start of the slice that posted";
+	}
+
+	TEST_F(IopThreadObject, AnItemThatWaitedForRoomKeepsTheTimeItWasProduced)
+	{
+		constexpr u32 kItems = static_cast<u32>(kI2EQueueCapacity) + 20;
+		std::atomic<u64> clock{1000};
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			for (u32 i = 0; i < kItems; i++)
+			{
+				clock.store(1000 + i);
+				thread->PostI2E(I2EKind::SbusIrq, i);
+			}
+		};
+		std::vector<I2EItem> received;
+		Params p = BaseParams();
+		p.iop_now = [&] { return clock.load(); };
+		p.handle_i2e = [&](const I2EItem& item) { received.push_back(item); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		ASSERT_TRUE(WaitEe([&] { return thread->GetStats().i2e_full_waits >= 1; }));
+		std::this_thread::sleep_for(2ms);
+		ASSERT_TRUE(WaitEe([&] {
+			if (thread->MayHaveI2E())
+				thread->DrainI2E();
+			return received.size() == kItems;
+		}));
+		for (u32 i = 0; i < kItems; i++)
+			ASSERT_EQ(received[i].stamp, 1000u + i) << "item " << i << " (the ones past the capacity waited for room)";
+	}
+
+	TEST_F(IopThreadObject, AnSbusItemTheEeTakesLateInAnIdleEventTestIsCountedAsAnOvershoot)
+	{
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			thread->PostI2E(I2EKind::SbusIrq, 1); // produced at IOP time 5000 (iop_now below)
+		};
+		Params p = BaseParams();
+		p.iop_now = [] { return u64(5000); };
+		p.handle_i2e = [](const I2EItem&) {};
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		ASSERT_TRUE(WaitPos(100));
+		ASSERT_TRUE(WaitEe([&] { return thread->MayHaveI2E(); }));
+
+		// The EE idles from cycle 3000 on, event test after event test, and takes the item at 200,000.
+		thread->NoteEventTest(3000, 0, 1);
+		for (u64 c = 6072; c <= 200000; c += 3072)
+			thread->NoteEventTest(c, FastForward::WaitLoop, 1);
+		ee_cycle = 200000;
+		thread->NoteEventTest(ee_cycle, FastForward::WaitLoop, 1);
+		ASSERT_EQ(thread->DrainI2E(), 1u);
+
+		const Stats st = thread->GetStats();
+		EXPECT_EQ(st.replies, 1u);
+		EXPECT_EQ(st.late_replies, 1u);
+		EXPECT_EQ(st.idle_overshoots, 1u);
+		EXPECT_EQ(st.idle_overshoot_max, 195000u);
+		EXPECT_EQ(st.late_ee_busy, 0u);
+		const ReplyStats& r = thread->Replies().Stats();
+		EXPECT_EQ(r.all[ReplyKind::SbusIrq].count, 1u);
+		EXPECT_EQ(r.overshoot[ReplyKind::SbusIrq].count, 1u);
+		EXPECT_EQ(r.all[ReplyKind::SbusIrq].max, 195000u);
+		EXPECT_EQ(st.ee_ff_wait_loop, 65u);
+	}
+
+	TEST_F(IopThreadObject, TheSameItemTakenInAnEventTestTheEeRanIntoIsLateButBusy)
+	{
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			thread->PostI2E(I2EKind::SbusIrq, 1);
+		};
+		Params p = BaseParams();
+		p.iop_now = [] { return u64(5000); };
+		p.handle_i2e = [](const I2EItem&) {};
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		ASSERT_TRUE(WaitPos(100));
+		ASSERT_TRUE(WaitEe([&] { return thread->MayHaveI2E(); }));
+		for (u64 c = 3000; c < 200000; c += 3072)
+			thread->NoteEventTest(c, FastForward::WaitLoop, 1);
+		ee_cycle = 200000;
+		thread->NoteEventTest(ee_cycle, 0, 1); // the EE ran into this one
+		ASSERT_EQ(thread->DrainI2E(), 1u);
+		const Stats st = thread->GetStats();
+		EXPECT_EQ(st.late_replies, 1u);
+		EXPECT_EQ(st.idle_overshoots, 0u);
+		EXPECT_EQ(st.late_ee_busy, 1u);
+	}
+
+	TEST_F(IopThreadObject, ACallOnEeIsAReplyStampedWithTheIopsTimeOfTheRequest)
+	{
+		std::atomic<bool> called{false};
+		fake.in_slice_hook = [&, once = false](u64, u64) mutable {
+			if (once)
+				return;
+			once = true;
+			thread->CallOnEE([&] { called.store(true); });
+		};
+		Params p = BaseParams();
+		p.iop_now = [] { return u64(7000); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		Publish(100);
+		thread->NoteEventTest(4000, 0, 1);
+		for (u64 c = 7072; c < 300000; c += 3072)
+			thread->NoteEventTest(c, FastForward::WaitLoop, 1);
+		ee_cycle = 300000;
+		thread->NoteEventTest(ee_cycle, FastForward::WaitLoop, 1);
+		ASSERT_TRUE(WaitEe([&] {
+			if (thread->MayHaveI2E())
+				thread->DrainI2E();
+			return called.load();
+		}));
+		const ReplyStats& r = thread->Replies().Stats();
+		EXPECT_EQ(r.all[ReplyKind::Call].count, 1u);
+		EXPECT_EQ(r.all[ReplyKind::Call].max, 293000u);
+		EXPECT_EQ(r.idle_overshoots, 1u);
+		EXPECT_EQ(r.overshoot[ReplyKind::Call].count, 1u);
+	}
+
+	TEST_F(IopThreadObjectLockstep, ADirectEffectOfALockstepIopIsCountedLikeAnItem)
+	{
+		Params p = BaseParams(IopThreadMode::Lockstep);
+		p.iop_now = [] { return u64(9000); };
+		StopOnExit stop_on_exit(*thread);
+		ASSERT_TRUE(thread->Start(p));
+		thread->NoteEventTest(5000, 0, 1);
+		for (u64 c = 8072; c <= 150000; c += 3072)
+			thread->NoteEventTest(c, FastForward::WaitLoop, 1);
+		ee_cycle = 150000;
+		thread->NoteEventTest(ee_cycle, FastForward::WaitLoop, 1);
+		const ReplyMonitor::Verdict v = thread->NoteReply(ReplyKind::Sif0Pump, static_cast<u32>(9000));
+		EXPECT_EQ(v.late, 141000u);
+		EXPECT_TRUE(v.overshoot);
+		EXPECT_EQ(thread->Replies().Stats().overshoot[ReplyKind::Sif0Pump].count, 1u);
+	}
+
 	TEST_F(IopThreadObject, ShutdownWhileTheIopWaitsForI2ESpaceCompletes)
 	{
 		bool all_posted = true;

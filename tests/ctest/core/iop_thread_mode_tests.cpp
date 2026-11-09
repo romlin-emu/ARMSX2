@@ -9,6 +9,7 @@
 
 #include "Config.h"
 #include "GameDatabase.h"
+#include "IopThread/IopChannels.h"
 #include "IopThread/IopThreadMode.h"
 #include "PerGameOverrides.h"
 
@@ -357,16 +358,27 @@ TEST(IopThreadModeLag, TheMinimumLeavesRoomForTheOvershootOfBothThreads)
 	EXPECT_GE(IopThread::kMinLag - IopThread::kEeWaitCycles, 7 * (kEeOvershootP90 + kIopOvershootP90));
 }
 
-TEST(IopThreadModeLag, TheMaximumIsSmallEnoughForTheEeToIopQueueAndBelowAMillisecond)
+TEST(IopThreadModeLag, TheMaximumIsTwoFramesAndTheEeToIopQueueHoldsAWindowOfPosts)
 {
-	// About 527 posts per frame go into a 1024-entry queue, so a window of the maximum lag holds a
-	// few dozen posts at most.
+	// The maximum is two NTSC frames of EE cycles. A window of that length holds the blanking posts of
+	// the busiest title seen (1052 per frame on OutRun) plus a few dozen SIF items per frame, and the
+	// queue has to hold all of them with room to spare: the lag keeps the EE from running further ahead
+	// than the window, and a full queue stalls the EE.
 	constexpr double kEeCyclesPerFrame = 294912000.0 / 60.0;
-	constexpr double kPostsPerFrame = 527.0;
-	constexpr double kQueueEntries = 1024.0;
-	EXPECT_LT(IopThread::kMaxLag / kEeCyclesPerFrame * kPostsPerFrame, kQueueEntries / 10.0);
+	constexpr double kPostsPerFrame = 1052.0 + 64.0;
+	constexpr double kQueueEntries = static_cast<double>(IopThread::kE2IRingCapacity);
+	EXPECT_EQ(IopThread::kMaxLag, 3200 * IopThread::kEeWaitCycles);
+	EXPECT_DOUBLE_EQ(IopThread::kMaxLag / kEeCyclesPerFrame, 2.0);
+	EXPECT_LT(IopThread::kMaxLag / kEeCyclesPerFrame * kPostsPerFrame, kQueueEntries / 3.0);
 	// The largest delay before the EE sees an IOP effect is the lag plus one event-test spacing.
-	EXPECT_LT((IopThread::kMaxLag + IopThread::kEeWaitCycles) / 294912000.0, 0.001);
+	EXPECT_LT((IopThread::kMaxLag + IopThread::kEeWaitCycles) / 294912000.0, 0.034);
+}
+
+TEST(IopThreadModeLag, TheMaximumLeavesS32Headroom)
+{
+	// The lag is an s32 and is added to cycle differences (EEsCycle is an s32 too).
+	EXPECT_EQ(IopThread::kMaxLag % IopThread::kEeWaitCycles, 0);
+	EXPECT_LT(static_cast<s64>(IopThread::kMaxLag) * 64, static_cast<s64>(INT32_MAX));
 }
 
 TEST(IopThreadModeLag, ValuesAtOrBelowTheEventTestSpacingAreRaisedToTheMinimum)
@@ -398,6 +410,8 @@ TEST(IopThreadModeLag, ValuesInRangeAreKept)
 	EXPECT_EQ(ClampLag(IopThread::kMinLag + 1), IopThread::kMinLag + 1);
 	EXPECT_EQ(ClampLag(IopThread::kDefaultLag), 24576);
 	EXPECT_EQ(ClampLag(12288), 12288);
+	EXPECT_EQ(ClampLag(196608), 196608); // the old maximum is an ordinary value now
+	EXPECT_EQ(ClampLag(4900000), 4900000); // about one frame
 	EXPECT_EQ(ClampLag(IopThread::kMaxLag - 1), IopThread::kMaxLag - 1);
 	EXPECT_EQ(ClampLag(IopThread::kMaxLag), IopThread::kMaxLag);
 }
@@ -405,7 +419,8 @@ TEST(IopThreadModeLag, ValuesInRangeAreKept)
 TEST(IopThreadModeLag, ValuesAboveTheMaximumAreLowered)
 {
 	EXPECT_EQ(ClampLag(IopThread::kMaxLag + 1), IopThread::kMaxLag);
-	EXPECT_EQ(ClampLag(1000000), IopThread::kMaxLag);
+	EXPECT_EQ(ClampLag(IopThread::kMaxLag * 2), IopThread::kMaxLag);
+	EXPECT_EQ(ClampLag(20000000), IopThread::kMaxLag);
 	EXPECT_EQ(ClampLag(INT_MAX), IopThread::kMaxLag);
 }
 
@@ -416,6 +431,7 @@ TEST(IopThreadModeLag, TheSettingsFileIsClampedWhenItIsRead)
 	EXPECT_EQ(LoadLag(3072), IopThread::kMinLag);
 	EXPECT_EQ(LoadLag(0), IopThread::kMinLag);
 	EXPECT_EQ(LoadLag(-5), IopThread::kMinLag);
+	EXPECT_EQ(LoadLag(196608), 196608);
 	EXPECT_EQ(LoadLag(INT_MAX), IopThread::kMaxLag);
 }
 
@@ -431,6 +447,7 @@ TEST(IopThreadSetting, TheKeysLiveInTheSpeedhacksSectionAndRoundTrip)
 	Pcsx2Config::SpeedhackOptions hacks;
 	hacks.iopThread = true;
 	hacks.iopThreadLockstep = true;
+	hacks.iopThreadDeferSif = true;
 	hacks.iopThreadLag = 9000;
 
 	MemorySettingsInterface si;
@@ -439,18 +456,21 @@ TEST(IopThreadSetting, TheKeysLiveInTheSpeedhacksSectionAndRoundTrip)
 		hacks.LoadSave(wrap);
 	}
 
-	bool enabled = false, lockstep = false;
+	bool enabled = false, lockstep = false, defer_sif = false;
 	s32 lag = 0;
 	ASSERT_TRUE(si.GetBoolValue("EmuCore/Speedhacks", "iopThread", &enabled));
 	ASSERT_TRUE(si.GetBoolValue("EmuCore/Speedhacks", "iopThreadLockstep", &lockstep));
+	ASSERT_TRUE(si.GetBoolValue("EmuCore/Speedhacks", "iopThreadDeferSif", &defer_sif));
 	ASSERT_TRUE(si.GetIntValue("EmuCore/Speedhacks", "iopThreadLag", &lag));
 	EXPECT_TRUE(enabled);
 	EXPECT_TRUE(lockstep);
+	EXPECT_TRUE(defer_sif);
 	EXPECT_EQ(lag, 9000);
 
 	const Pcsx2Config::SpeedhackOptions loaded = LoadHacks(si);
 	EXPECT_TRUE(loaded.iopThread);
 	EXPECT_TRUE(loaded.iopThreadLockstep);
+	EXPECT_TRUE(loaded.iopThreadDeferSif);
 	EXPECT_EQ(loaded.iopThreadLag, 9000);
 }
 
@@ -459,9 +479,11 @@ TEST(IopThreadSetting, TheKeysAreReadFromTheFile)
 	MemorySettingsInterface si;
 	si.SetBoolValue("EmuCore/Speedhacks", "iopThread", true);
 	si.SetBoolValue("EmuCore/Speedhacks", "iopThreadLockstep", true);
+	si.SetBoolValue("EmuCore/Speedhacks", "iopThreadDeferSif", true);
 	const Pcsx2Config::SpeedhackOptions hacks = LoadHacks(si);
 	EXPECT_TRUE(hacks.iopThread);
 	EXPECT_TRUE(hacks.iopThreadLockstep);
+	EXPECT_TRUE(hacks.iopThreadDeferSif);
 }
 
 TEST(IopThreadSetting, ASetFlagThatTheFileLeavesOutStaysSetLikeTheOtherSpeedhacks)
@@ -488,6 +510,10 @@ TEST(IopThreadSetting, EachKeyTakesPartInEquality)
 	b.iopThreadLockstep = true;
 	EXPECT_TRUE(b != base);
 
+	Pcsx2Config::SpeedhackOptions d = base;
+	d.iopThreadDeferSif = true;
+	EXPECT_TRUE(d != base);
+
 	Pcsx2Config::SpeedhackOptions c = base;
 	c.iopThreadLag = base.iopThreadLag + 1;
 	EXPECT_TRUE(c != base);
@@ -500,9 +526,11 @@ TEST(IopThreadSetting, DisableAllTurnsTheFeatureOff)
 	Pcsx2Config::SpeedhackOptions hacks;
 	hacks.iopThread = true;
 	hacks.iopThreadLockstep = true;
+	hacks.iopThreadDeferSif = true;
 	hacks.DisableAll();
 	EXPECT_FALSE(hacks.iopThread);
 	EXPECT_FALSE(hacks.iopThreadLockstep);
+	EXPECT_FALSE(hacks.iopThreadDeferSif);
 }
 
 TEST(IopThreadSetting, NoOtherSpeedhackBitMoved)
@@ -525,6 +553,15 @@ TEST(IopThreadSetting, NoOtherSpeedhackBitMoved)
 	EXPECT_EQ(only([](auto& h) { h.vu1Instant = true; }), 1u << 5);
 	EXPECT_EQ(only([](auto& h) { h.iopThread = true; }), 1u << 6);
 	EXPECT_EQ(only([](auto& h) { h.iopThreadLockstep = true; }), 1u << 7);
+	EXPECT_EQ(only([](auto& h) { h.DynamicEECycleRate = true; }), 1u << 8);
+	EXPECT_EQ(only([](auto& h) { h.iopThreadDeferSif = true; }), 1u << 9);
+}
+
+TEST(IopThreadSetting, TheSifDeferralIsOffByDefaultAndHasNoGameDatabaseName)
+{
+	EXPECT_FALSE(Pcsx2Config::SpeedhackOptions().iopThreadDeferSif);
+	// INI only: not one of the SpeedHack ids a game entry or a per-game override can carry.
+	EXPECT_FALSE(Pcsx2Config::SpeedhackOptions::ParseSpeedHackName("iopThreadDeferSif").has_value());
 }
 
 TEST(IopThreadGameDB, TheHackHasAnIniNameAndAGameDatabaseName)
