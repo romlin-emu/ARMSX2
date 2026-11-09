@@ -67,6 +67,24 @@ namespace IopThread
 	};
 	TierPlan PlanTier(u64 performance_mask, bool mtvu, bool iop_thread);
 
+	/// Whether the Linux ordered thread pin (EnableThreadPinning) may be applied: false only when the performance tier can
+	/// be read and cannot hold the EE, GS and, with MTVU, VU1 threads. The pin hands out processors fastest first, so on
+	/// a tier of two it puts the GS thread on a slow core, and measured on the MQ65 with two fast cores it lost 30 to 45%
+	/// speed in every game. The IOP thread is not counted: it goes outside the tier (UnpinnedIopThreadMask). True when the
+	/// tier cannot be read (mask 0), which leaves a host that has no capacity source as it was.
+	bool OrderedPinAllowed(u64 performance_mask, bool mtvu);
+
+	/// Whether the game database's GS back-thread split fits on a host: the EE, VU1, GS front and GS back threads each
+	/// want a performance core, and a concurrent IOP thread wants a fifth. It is busy 40 to 99% of a core, and with it
+	/// running and only four big cores the split measured slower than a single GS thread in most games tried, even with
+	/// the prime core rule. There also has to be a slower core left to keep the rest off the tier: a host whose
+	/// every processor is in the tier (`performance_cores >= processors`) has none.
+	///
+	/// `iop_thread_threaded` is whether the IOP thread will actually run concurrently on this host, which is what
+	/// IopThread::ResolveMode says (Threaded), not whether the setting is on: on a host that can never give Threaded the
+	/// setting costs the split nothing.
+	bool GsSplitFits(u32 performance_cores, u32 processors, bool iop_thread_threaded);
+
 	/// The processors the IOP thread runs on when nothing places it on one of its own (the caller asks for "any
 	/// processor"), for a concurrent IOP thread on a host whose performance tier is narrower than the threads that want
 	/// it (PlanTier says the tier does not fit): every processor outside the tier. 0, meaning any processor, when the

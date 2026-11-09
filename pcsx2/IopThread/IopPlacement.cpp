@@ -68,6 +68,17 @@ IopThread::TierPlan IopThread::PlanTier(u64 performance_mask, bool mtvu, bool io
 	return plan;
 }
 
+bool IopThread::OrderedPinAllowed(u64 performance_mask, bool mtvu)
+{
+	return performance_mask == 0 || PlanTier(performance_mask, mtvu, false).tier_fits;
+}
+
+bool IopThread::GsSplitFits(u32 performance_cores, u32 processors, bool iop_thread_threaded)
+{
+	const u32 needed = 4 + (iop_thread_threaded ? 1 : 0);
+	return performance_cores >= needed && performance_cores < processors;
+}
+
 u64 IopThread::UnpinnedIopThreadMask(u64 performance_mask, u64 all_mask, bool mtvu, bool concurrent)
 {
 	if (!concurrent || performance_mask == 0)

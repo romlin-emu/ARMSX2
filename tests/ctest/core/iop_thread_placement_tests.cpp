@@ -819,3 +819,229 @@ TEST(IopThreadPrimeArbiter, NothingRunningKeepsTheOwnerAsItWas)
 	ASSERT_EQ(PrimeArbiterUpdate(a, Load(95, 20, 40, 30)), IopThread::kPrimeEE);
 	EXPECT_EQ(PrimeArbiterUpdate(a, Load(-1, -1, -1, -1)), IopThread::kPrimeEE);
 }
+
+// ---------------------------------------------------------------- the GS split and the IOP thread
+
+TEST(IopThreadGsSplit, FourPerformanceCoresSplitWithoutAnIopThread)
+{
+	// EE, VU1, GS front and GS back, and a slower core left over.
+	EXPECT_TRUE(IopThread::GsSplitFits(4, 8, false));
+	EXPECT_TRUE(IopThread::GsSplitFits(5, 8, false));
+	EXPECT_FALSE(IopThread::GsSplitFits(3, 8, false));
+}
+
+TEST(IopThreadGsSplit, AConcurrentIopThreadNeedsAFifthPerformanceCore)
+{
+	// The measured result: four big cores and the IOP thread, the split was slower than one GS thread.
+	EXPECT_FALSE(IopThread::GsSplitFits(4, 8, true)); // SD865, MQ65, Dimensity 8300
+	EXPECT_TRUE(IopThread::GsSplitFits(5, 8, true));
+	EXPECT_TRUE(IopThread::GsSplitFits(8, 12, true)); // M2 Max
+	EXPECT_FALSE(IopThread::GsSplitFits(2, 8, true)); // RG 55G1
+}
+
+TEST(IopThreadGsSplit, ATierThatIsEveryProcessorHasNothingSlowerToKeepTheRestOn)
+{
+	EXPECT_FALSE(IopThread::GsSplitFits(8, 8, false));
+	EXPECT_FALSE(IopThread::GsSplitFits(8, 8, true));
+	EXPECT_FALSE(IopThread::GsSplitFits(4, 4, false));
+}
+
+TEST(IopThreadGsSplit, ASettingThatNeverRunsCostsNoCore)
+{
+	// An x86 Linux hybrid with four P-cores and E-cores, the IOP thread setting on (a player turned it on, or the game
+	// database did): ResolveMode gives Off on x86, and the split keeps the four-core answer. CanSplitGS feeds the helper
+	// this ResolveMode answer.
+	IopThread::HostCpuInfo x86_hybrid;
+	x86_hybrid.is_arm64 = false;
+	x86_hybrid.total_cores = 12;
+	x86_hybrid.performance_cores = 4;
+	Pcsx2Config config;
+	config.Speedhacks.iopThread = true;
+	const bool threaded = IopThread::ResolveMode(config, x86_hybrid, {}) == IopThreadMode::Threaded;
+	EXPECT_FALSE(threaded);
+	EXPECT_TRUE(IopThread::GsSplitFits(x86_hybrid.performance_cores, x86_hybrid.total_cores, threaded));
+
+	// The same four fast cores on an ARM64 phone that does run the thread: no split.
+	IopThread::HostCpuInfo arm_phone = x86_hybrid;
+	arm_phone.is_arm64 = true;
+	arm_phone.total_cores = 8;
+	const bool arm_threaded = IopThread::ResolveMode(config, arm_phone, {}) == IopThreadMode::Threaded;
+	EXPECT_TRUE(arm_threaded);
+	EXPECT_FALSE(IopThread::GsSplitFits(arm_phone.performance_cores, arm_phone.total_cores, arm_threaded));
+
+	// And one that cannot run it (one fast core): not Threaded, and too few cores for the split either way.
+	IopThread::HostCpuInfo one_fast = arm_phone;
+	one_fast.performance_cores = 1;
+	EXPECT_NE(IopThread::ResolveMode(config, one_fast, {}), IopThreadMode::Threaded);
+}
+
+// ---------------------------------------------------------------- the IOP thread default and the ordered pin
+
+namespace
+{
+	// The MQ65 with cpu6 and cpu7 offline, as the study simulated the RG 55G1: cpu0-3 are A53 and cpu4-5 are A73. Offline
+	// processors are not in the table, so it holds six.
+	std::vector<IopThread::CpuCapacity> Mq65TwoFast()
+	{
+		std::vector<CpuCapacity> cpus;
+		Add(cpus, 0, 4, 611); // A53
+		Add(cpus, 4, 2, 1024); // A73
+		return cpus;
+	}
+
+	// The MQ65 with cpu7 offline.
+	std::vector<IopThread::CpuCapacity> Mq65ThreeFast()
+	{
+		std::vector<CpuCapacity> cpus;
+		Add(cpus, 0, 4, 611); // A53
+		Add(cpus, 4, 3, 1024); // A73
+		return cpus;
+	}
+
+	// One fast core and seven slow ones.
+	std::vector<IopThread::CpuCapacity> OneFastCore()
+	{
+		std::vector<CpuCapacity> cpus;
+		Add(cpus, 0, 7, 280);
+		Add(cpus, 7, 1, 1024);
+		return cpus;
+	}
+
+	// Eight cores of one speed.
+	std::vector<IopThread::CpuCapacity> Uniform8()
+	{
+		std::vector<CpuCapacity> cpus;
+		Add(cpus, 0, 8, 1024);
+		return cpus;
+	}
+
+	HostCpuInfo HostOf(bool arm64, u32 total_cores, u32 performance_cores)
+	{
+		HostCpuInfo host;
+		host.is_arm64 = arm64;
+		host.total_cores = total_cores;
+		host.performance_cores = performance_cores;
+		return host;
+	}
+
+	bool DefaultOnFor(const std::vector<CpuCapacity>& cpus, bool mtvu)
+	{
+		return IopThread::DefaultOnForHost(MakeHostInfo(true, static_cast<u32>(cpus.size()), PerformanceMask(cpus)), mtvu);
+	}
+} // namespace
+
+TEST(IopThreadDefaultOn, TheRuleIsTwoOrThreeFastCores)
+{
+	EXPECT_EQ(IopThread::kMinPerformanceCores, 2u);
+	EXPECT_EQ(IopThread::kMaxDefaultOnPerformanceCores, 3u);
+
+	// One tier size at a time, on a host with cores to spare and MTVU on or off.
+	for (const bool mtvu : {true, false})
+	{
+		EXPECT_FALSE(IopThread::DefaultOnForHost(MakeHostInfo(true, 8, 0), mtvu)) << "unreadable tier, mtvu " << mtvu;
+		EXPECT_FALSE(IopThread::DefaultOnForHost(HostOf(true, 8, 1), mtvu)) << "one fast core, mtvu " << mtvu;
+		EXPECT_TRUE(IopThread::DefaultOnForHost(HostOf(true, 8, 2), mtvu)) << "two fast cores, mtvu " << mtvu;
+		EXPECT_TRUE(IopThread::DefaultOnForHost(HostOf(true, 8, 3), mtvu)) << "three fast cores, mtvu " << mtvu;
+		EXPECT_FALSE(IopThread::DefaultOnForHost(HostOf(true, 8, 4), mtvu)) << "four fast cores, mtvu " << mtvu;
+		EXPECT_FALSE(IopThread::DefaultOnForHost(HostOf(true, 12, 8), mtvu)) << "eight fast cores, mtvu " << mtvu;
+	}
+}
+
+TEST(IopThreadDefaultOn, AHostThatCannotRunTheThreadNeverGetsItOn)
+{
+	// Two fast cores each, but ResolveMode would say Off, so the setting does not start on.
+	EXPECT_FALSE(IopThread::DefaultOnForHost(HostOf(false, 12, 2), true)); // not ARM64
+	EXPECT_FALSE(IopThread::DefaultOnForHost(HostOf(true, 4, 2), false)); // 3 threads need 5 cores
+	EXPECT_FALSE(IopThread::DefaultOnForHost(HostOf(true, 5, 2), true)); // 4 threads need 6 cores
+	EXPECT_TRUE(IopThread::DefaultOnForHost(HostOf(true, 5, 2), false));
+	EXPECT_TRUE(IopThread::DefaultOnForHost(HostOf(true, 6, 2), true));
+}
+
+TEST(IopThreadDefaultOn, TheDevicesTheDecisionWasMadeOn)
+{
+	// On: two fast cores. The RG 55G1 (2 A78 + 6 A55), and the MQ65 with two fast cores online, where it was measured.
+	EXPECT_TRUE(DefaultOnFor(Rg55g1(), true));
+	EXPECT_TRUE(DefaultOnFor(Rg55g1(), false));
+	EXPECT_TRUE(DefaultOnFor(Mq65TwoFast(), true));
+	EXPECT_TRUE(DefaultOnFor(Mq65TwoFast(), false));
+	// On: three fast cores (not measured; included by decision).
+	EXPECT_TRUE(DefaultOnFor(Mq65ThreeFast(), true));
+
+	// Off: four or more fast cores. The thread gained nothing there in the games measured (they are GS-bound) and takes
+	// a fast core.
+	EXPECT_FALSE(DefaultOnFor(Mq65(), true)); // MQ65 with all cores
+	EXPECT_FALSE(DefaultOnFor(Sd865(), true));
+	EXPECT_FALSE(DefaultOnFor(Dimensity8300(), true));
+	EXPECT_FALSE(DefaultOnFor(Sd662(), true));
+	EXPECT_FALSE(DefaultOnFor(M2Max(), true));
+	EXPECT_FALSE(DefaultOnFor(Rk3562(), false)); // four cores of one speed: the tier is four, and four is too few cores anyway
+
+	// Off: one fast core, and eight alike cores (a tier of eight).
+	EXPECT_FALSE(DefaultOnFor(OneFastCore(), true));
+	EXPECT_FALSE(DefaultOnFor(Uniform8(), true));
+}
+
+TEST(IopThreadDefaultOn, ItAgreesWithResolveModeWhereItSaysOn)
+{
+	// Wherever the rule says on, ResolveMode really gives Threaded with the setting on: the default never asks for a thread
+	// the host would refuse.
+	const std::vector<std::vector<CpuCapacity>> devices = {
+		Rg55g1(), Mq65TwoFast(), Mq65ThreeFast(), Mq65(), Sd865(), Dimensity8300(), Sd662(), M2Max(), Rk3562(), OneFastCore(), Uniform8()};
+	for (const auto& cpus : devices)
+	{
+		for (const bool mtvu : {true, false})
+		{
+			if (DefaultOnFor(cpus, mtvu))
+				EXPECT_EQ(ResolveFor(cpus, false, mtvu), IopThreadMode::Threaded) << cpus.size() << " cores, mtvu " << mtvu;
+		}
+	}
+}
+
+TEST(IopThreadOrderedPin, TwoFastCoresCannotHoldEeGsAndVu1)
+{
+	// With MTVU on the pin needs three fast cores for EE, VU1 and GS; with it off, two for EE and GS.
+	for (const auto& cpus : {Rg55g1(), Mq65TwoFast()})
+	{
+		const u64 tier = PerformanceMask(cpus);
+		ASSERT_EQ(std::popcount(tier), 2);
+		EXPECT_FALSE(IopThread::OrderedPinAllowed(tier, true));
+		EXPECT_TRUE(IopThread::OrderedPinAllowed(tier, false));
+	}
+}
+
+TEST(IopThreadOrderedPin, OneFastCoreCannotHoldThemWithMtvuOnOrOff)
+{
+	const u64 tier = PerformanceMask(OneFastCore());
+	ASSERT_EQ(std::popcount(tier), 1);
+	EXPECT_FALSE(IopThread::OrderedPinAllowed(tier, true));
+	EXPECT_FALSE(IopThread::OrderedPinAllowed(tier, false));
+}
+
+TEST(IopThreadOrderedPin, ThreeOrMoreFastCoresKeepThePin)
+{
+	// The IOP thread is not counted: it goes outside the tier, so three is enough for EE, VU1 and GS.
+	EXPECT_TRUE(IopThread::OrderedPinAllowed(PerformanceMask(Mq65ThreeFast()), true));
+	EXPECT_TRUE(IopThread::OrderedPinAllowed(PerformanceMask(Mq65()), true));
+	EXPECT_TRUE(IopThread::OrderedPinAllowed(PerformanceMask(Sd865()), true));
+	EXPECT_TRUE(IopThread::OrderedPinAllowed(PerformanceMask(Dimensity8300()), true));
+	EXPECT_TRUE(IopThread::OrderedPinAllowed(PerformanceMask(M2Max()), true));
+	EXPECT_TRUE(IopThread::OrderedPinAllowed(PerformanceMask(Uniform8()), true));
+	EXPECT_TRUE(IopThread::OrderedPinAllowed(PerformanceMask(Rk3562()), true)); // four alike cores
+}
+
+TEST(IopThreadOrderedPin, ATierThatCannotBeReadLeavesThePinAlone)
+{
+	// A host with no capacity source (Windows) has no mask; the pin is as it was there.
+	EXPECT_TRUE(IopThread::OrderedPinAllowed(0, true));
+	EXPECT_TRUE(IopThread::OrderedPinAllowed(0, false));
+}
+
+TEST(IopThreadOrderedPin, TheSamePlannerSaysWhereTheIopThreadGoesWhenThePinIsSkipped)
+{
+	// Where the pin is skipped the thread goes outside the tier: the processors that are not fast. (The IOP thread is
+	// placed there by SetEmuThreadAffinities through UnpinnedIopThreadMask.)
+	const std::vector<CpuCapacity> cpus = Mq65TwoFast();
+	const u64 tier = PerformanceMask(cpus);
+	ASSERT_FALSE(IopThread::OrderedPinAllowed(tier, true));
+	EXPECT_EQ(IopThread::UnpinnedIopThreadMask(tier, AllProcessors(cpus), true, true), 0xFu);
+}
