@@ -89,6 +89,24 @@ namespace
 		return cpus;
 	}
 
+	// The RG 55G1: two Cortex-A78 (cpu6-7) and six Cortex-A55 (cpu0-5).
+	std::vector<CpuCapacity> Rg55g1()
+	{
+		std::vector<CpuCapacity> cpus;
+		Add(cpus, 0, 6, 280); // A55
+		Add(cpus, 6, 2, 1024); // A78
+		return cpus;
+	}
+
+	// The processors of a table, as the mask VMManager builds from cpuinfo.
+	u64 AllProcessors(const std::vector<CpuCapacity>& cpus)
+	{
+		u64 all = 0;
+		for (const CpuCapacity& cpu : cpus)
+			all |= 1ull << cpu.processor_id;
+		return all;
+	}
+
 	Pcsx2Config Requested(bool lockstep, bool mtvu)
 	{
 		Pcsx2Config config;
@@ -217,17 +235,36 @@ TEST(IopThreadResolveFromMask, TheRk3562StillRunsLockstep)
 	EXPECT_EQ(ResolveFor(Rk3562(), true, true), IopThreadMode::Lockstep);
 }
 
-TEST(IopThreadResolveFromMask, ADeviceWithTooFewFastCoresForTheThreadsIsOff)
+TEST(IopThreadResolveFromMask, ADeviceWithFewerFastCoresThanThreadsIsStillThreaded)
 {
-	// Three fast cores and five slow ones: eight cores in total, but a tier of three cannot hold the EE,
-	// the GS, the VU1 thread and the IOP.
+	// Three fast cores and five slow ones: a tier of three cannot hold the EE, the GS, the VU1 thread and the IOP, so
+	// the IOP thread runs on the slow ones (UnpinnedIopThreadMask). Eight cores leave two for the rest.
 	std::vector<CpuCapacity> cpus;
 	Add(cpus, 0, 5, 300);
 	Add(cpus, 5, 3, 1024);
 	EXPECT_EQ(PerformanceMask(cpus), 0xE0u);
-	EXPECT_EQ(ResolveFor(cpus, false, true), IopThreadMode::Off);
-	// Without MTVU it needs three, and has three.
+	EXPECT_EQ(ResolveFor(cpus, false, true), IopThreadMode::Threaded);
 	EXPECT_EQ(ResolveFor(cpus, false, false), IopThreadMode::Threaded);
+}
+
+TEST(IopThreadResolveFromMask, TheRg55g1HasTwoBigCoresAndIsThreadedWithTheIopThreadOnTheLittleOnes)
+{
+	const std::vector<CpuCapacity> cpus = Rg55g1();
+	EXPECT_EQ(PerformanceMask(cpus), 0xC0u);
+	for (const bool mtvu : {true, false})
+	{
+		EXPECT_EQ(ResolveFor(cpus, false, mtvu), IopThreadMode::Threaded);
+		// And the thread is placed outside the two big cores, which is what makes Threaded safe there.
+		EXPECT_EQ(IopThread::UnpinnedIopThreadMask(PerformanceMask(cpus), AllProcessors(cpus), mtvu, true), 0x3Fu);
+	}
+}
+
+TEST(IopThreadResolveFromMask, AHostWithTwoBigAndTwoLittleCoresStillHasNoCoreToSpare)
+{
+	std::vector<CpuCapacity> cpus;
+	Add(cpus, 0, 2, 280);
+	Add(cpus, 2, 2, 1024);
+	EXPECT_EQ(ResolveFor(cpus, false, false), IopThreadMode::Off);
 }
 
 TEST(IopThreadResolveFromMask, ADeviceWhoseCoresCannotBeReadIsOffForThreadedAndOnForLockstep)
@@ -386,6 +423,64 @@ TEST(IopThreadPlaceTier, TheEightCoreM2KeepsEveryThreadAndTheBackThread)
 	const auto plan = IopThread::PlanTier(0xFF0, true, true);
 	EXPECT_TRUE(plan.tier_fits);
 	EXPECT_TRUE(plan.back_thread_fits);
+}
+
+TEST(IopThreadUnpinnedMask, TheRg55g1TierHoldsTwoThreadsSoTheIopThreadGoesToTheLittleCores)
+{
+	const std::vector<CpuCapacity> cpus = Rg55g1();
+	ASSERT_EQ(PerformanceMask(cpus), 0xC0u);
+	for (const bool mtvu : {true, false})
+		EXPECT_EQ(IopThread::UnpinnedIopThreadMask(PerformanceMask(cpus), AllProcessors(cpus), mtvu, true), 0x3Fu) << "mtvu " << mtvu;
+}
+
+TEST(IopThreadUnpinnedMask, ATierWithRoomForEveryThreadLeavesTheThreadFree)
+{
+	// The thread floats exactly as it did before there was such a mask.
+	for (const std::vector<CpuCapacity>& cpus : {Sd865(), Mq65(), Dimensity8300(), M2Max(), Sd662()})
+	{
+		for (const bool mtvu : {true, false})
+			EXPECT_EQ(IopThread::UnpinnedIopThreadMask(PerformanceMask(cpus), AllProcessors(cpus), mtvu, true), 0u);
+	}
+}
+
+TEST(IopThreadUnpinnedMask, TheTierMustHoldTheVuThreadToo)
+{
+	// Three fast cores and five slow ones: enough for the EE, the GS and the IOP, not once MTVU adds the VU1 thread.
+	std::vector<CpuCapacity> cpus;
+	Add(cpus, 0, 5, 300);
+	Add(cpus, 5, 3, 1024);
+	ASSERT_EQ(PerformanceMask(cpus), 0xE0u);
+	EXPECT_EQ(IopThread::UnpinnedIopThreadMask(PerformanceMask(cpus), AllProcessors(cpus), false, true), 0u);
+	EXPECT_EQ(IopThread::UnpinnedIopThreadMask(PerformanceMask(cpus), AllProcessors(cpus), true, true), 0x1Fu);
+}
+
+TEST(IopThreadUnpinnedMask, ATierThatCannotBeReadLeavesTheThreadFree)
+{
+	std::vector<CpuCapacity> cpus;
+	Add(cpus, 0, 8, 0);
+	EXPECT_EQ(IopThread::UnpinnedIopThreadMask(PerformanceMask(cpus), AllProcessors(cpus), true, true), 0u);
+	EXPECT_EQ(IopThread::UnpinnedIopThreadMask(0, 0xFF, true, true), 0u);
+}
+
+TEST(IopThreadUnpinnedMask, AnIopThreadThatTakesTurnsWithTheEeIsNeverMoved)
+{
+	// Lockstep: the two threads never run together, so the IOP thread wants no processor of its own.
+	const std::vector<CpuCapacity> cpus = Rg55g1();
+	EXPECT_EQ(IopThread::UnpinnedIopThreadMask(PerformanceMask(cpus), AllProcessors(cpus), true, false), 0u);
+}
+
+TEST(IopThreadUnpinnedMask, NothingOutsideTheTierLeavesTheThreadFree)
+{
+	// A two-core host whose cores are both in the tier: there is nowhere outside to send it.
+	EXPECT_EQ(IopThread::UnpinnedIopThreadMask(0x3, 0x3, true, true), 0u);
+}
+
+TEST(IopThreadUnpinnedMask, TheMaskIsTheProcessorsOutsideTheTierWhateverTheirNumbers)
+{
+	// Linux ids need not be contiguous: cores 1, 3 and 6 are offline.
+	std::vector<CpuCapacity> cpus = {{0, 300, true}, {2, 300, true}, {4, 300, true}, {5, 300, true}, {7, 1024, true}, {8, 1024, true}};
+	ASSERT_EQ(PerformanceMask(cpus), (1ull << 7) | (1ull << 8));
+	EXPECT_EQ(IopThread::UnpinnedIopThreadMask(PerformanceMask(cpus), AllProcessors(cpus), false, true), (1ull << 0) | (1ull << 2) | (1ull << 4) | (1ull << 5));
 }
 
 namespace

@@ -7,8 +7,9 @@
 // and takes a place in the same plans.
 //
 // The same file holds the one rule shared with ResolveMode: which processors are the performance
-// tier. ResolveMode counts them to decide whether the host has a core to spare, and the Android
-// tier mode confines the emulation threads to them, so both read the same mask.
+// tier. ResolveMode needs the tier to be readable, the Android tier mode confines the emulation
+// threads to it, and a concurrent IOP thread is kept out of a tier that is too narrow for the
+// threads, so all of them read the same mask.
 
 #pragma once
 
@@ -65,6 +66,17 @@ namespace IopThread
 		bool back_thread_fits = false; // and one more for the GS back thread, which otherwise stays unpinned
 	};
 	TierPlan PlanTier(u64 performance_mask, bool mtvu, bool iop_thread);
+
+	/// The processors the IOP thread runs on when nothing places it on one of its own (the caller asks for "any
+	/// processor"), for a concurrent IOP thread on a host whose performance tier is narrower than the threads that want
+	/// it (PlanTier says the tier does not fit): every processor outside the tier. 0, meaning any processor, when the
+	/// IOP thread takes turns with the EE (Lockstep), when the tier cannot be read, when the tier has room for all the
+	/// threads, or when there is no processor outside it.
+	///
+	/// The thread spins while it waits for the EE. Left to float it spends part of its time on the big cores and
+	/// pushes the EE, GS and VU1 threads onto the little ones: on the RG 55G1 (two Cortex-A78, six Cortex-A55) 41% of
+	/// its cycles landed on the big cores when it floated.
+	u64 UnpinnedIopThreadMask(u64 performance_mask, u64 all_mask, bool mtvu, bool concurrent);
 
 	/// Android's ranked modes (1 to 6): each thread gets one processor from the list ordered fastest
 	/// first. ee, vu and gs are ranks; the caller clamps them to the list. The IOP thread

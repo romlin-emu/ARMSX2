@@ -699,6 +699,29 @@ bool VMManager::Internal::CheckSettingsVersion()
 	return (bsi->GetUIntValue("UI", "SettingsVersion", &settings_version) && settings_version == SETTINGS_VERSION);
 }
 
+// A settings file marks itself with this key in [UI] once the lag default has been dealt with: SetDefaultSettings sets it
+// in a new file, and MigrateSettings sets it after moving an old one.
+static constexpr const char* IOP_THREAD_LAG_MIGRATED_KEY = "IopThreadLagMigrated";
+
+// What iopThreadLag defaulted to before it became one frame (IopThread::kDefaultSettingLag). A file made then holds this
+// exact value, so it is a stored default and not a choice. Kept as a number of its own: IopThread::kDefaultLag, which
+// has the same value, is the tight bound the lag rules use, and has to be free to move without moving this.
+static constexpr int IOP_THREAD_LAG_OLD_DEFAULT = 24576;
+
+bool VMManager::Internal::MigrateSettings(SettingsInterface& bsi)
+{
+	if (bsi.GetBoolValue("UI", IOP_THREAD_LAG_MIGRATED_KEY, false))
+		return false;
+
+	bsi.SetBoolValue("UI", IOP_THREAD_LAG_MIGRATED_KEY, true);
+
+	int lag = 0;
+	if (bsi.GetIntValue("EmuCore/Speedhacks", "iopThreadLag", &lag) && lag == IOP_THREAD_LAG_OLD_DEFAULT)
+		bsi.SetIntValue("EmuCore/Speedhacks", "iopThreadLag", IopThread::kDefaultSettingLag);
+
+	return true;
+}
+
 void VMManager::Internal::LoadStartupSettings()
 {
 	SettingsInterface* bsi = Host::Internal::GetBaseSettingsLayer();
@@ -735,6 +758,9 @@ void VMManager::SetDefaultSettings(
 		Pcsx2Config temp_config;
 		SettingsSaveWrapper ssw(si);
 		temp_config.LoadSave(ssw);
+
+		// The defaults just written are the current ones, so nothing in this file needs MigrateSettings.
+		si.SetBoolValue("UI", IOP_THREAD_LAG_MIGRATED_KEY, true);
 
 		// Settings not part of the Pcsx2Config struct.
 		si.SetBoolValue("EmuCore", "EnableFastBoot", true);
@@ -5088,13 +5114,45 @@ bool VMManager::Internal::GSBackThreadWouldShareBusyCore()
 int g_android_affinity_mode = 7;
 #endif
 
+// Where an IOP thread that was not given a processor of its own goes (IopThread::UnpinnedIopThreadMask): outside
+// the performance tier when the tier is too narrow for every thread that wants it. 0 when it can float.
+static u64 GetIopThreadOutsideTierMask()
+{
+#if defined(__linux__)
+	VMManager::EnsureCPUInfoInitialized();
+	u64 all = 0;
+	const u32 count = cpuinfo_get_processors_count();
+	for (u32 i = 0; i < count; i++)
+	{
+		const cpuinfo_processor* proc = cpuinfo_get_processor(i);
+		if (proc && GetProcessorIdForProcessor(proc) < 64)
+			all |= static_cast<u64>(1) << GetProcessorIdForProcessor(proc);
+	}
+	return IopThread::UnpinnedIopThreadMask(GetPerformanceCoresMask(), all, EmuConfig.Speedhacks.vuThread, IopThread::PlacesThread());
+#else
+	return 0; // no capacity source here: the tier cannot be read
+#endif
+}
+
 // The IOP thread's place. The thread begins with the affinity of the thread that created it, which is the CPU
 // thread, and that may have been narrowed to one core, so a thread that exists is always given a mask explicitly
 // (0 meaning any processor) rather than left to inherit one. Without a thread there is nothing to place.
+//
+// "Any processor" is the wrong answer on a host whose performance tier is narrower than the threads that want it,
+// whichever affinity mode asked for it: the thread spins while it waits, and floating it puts it on the big cores
+// beside the EE, GS and VU1 threads. Those requests become "every processor outside the tier".
 static void SetIopThreadAffinity(u64 mask)
 {
-	if (IopThread::g_thread.IsRunning())
-		IopThread::g_thread.GetThreadHandle().SetAffinity(mask);
+	if (!IopThread::g_thread.IsRunning())
+		return;
+
+	if (mask == 0)
+	{
+		mask = GetIopThreadOutsideTierMask();
+		if (mask != 0)
+			INFO_LOG("IOP thread pinned outside the performance tier (mask 0x{:x})", mask);
+	}
+	IopThread::g_thread.GetThreadHandle().SetAffinity(mask);
 }
 
 // The prime core. On a part with one core clearly faster than the rest of its performance tier, the
