@@ -317,7 +317,16 @@ namespace
 				vc.ADSR.Counter = r.Below(0x8000);
 				vc.ADSR.Value = r.Below(0x8000);
 				const u32 pick = r.Below(100);
-				vc.ADSR.Phase = pick < 40 ? V_ADSR::PHASE_STOPPED : pick < 52 ? V_ADSR::PHASE_ATTACK : pick < 62 ? V_ADSR::PHASE_DECAY : pick < 82 ? V_ADSR::PHASE_SUSTAIN : V_ADSR::PHASE_RELEASE;
+				if (pick < 40)
+					vc.ADSR.Phase = V_ADSR::PHASE_STOPPED;
+				else if (pick < 52)
+					vc.ADSR.Phase = V_ADSR::PHASE_ATTACK;
+				else if (pick < 62)
+					vc.ADSR.Phase = V_ADSR::PHASE_DECAY;
+				else if (pick < 82)
+					vc.ADSR.Phase = V_ADSR::PHASE_SUSTAIN;
+				else
+					vc.ADSR.Phase = V_ADSR::PHASE_RELEASE;
 				if (r.Chance(35))
 				{
 					// The values the envelope's comparisons and clamps turn on, and a counter about to overflow.
@@ -400,7 +409,16 @@ namespace
 		}
 
 		const u32 pm = r.Below(100);
-		PlayMode = pm < 80 ? 0 : pm < 85 ? 1 : pm < 90 ? 2 : pm < 95 ? 4 : 8;
+		if (pm < 80)
+			PlayMode = 0;
+		else if (pm < 85)
+			PlayMode = 1;
+		else if (pm < 90)
+			PlayMode = 2;
+		else if (pm < 95)
+			PlayMode = 4;
+		else
+			PlayMode = 8;
 		OutPos = static_cast<u16>(r.Below(0x200));
 		InputPos = 0;
 		Cycles = r.Chance(30) ? (0xFFFFFFF0u - r.Below(64)) : r.U32();
@@ -644,7 +662,12 @@ namespace
 				u64 v = 0;
 				if (read(e.fd, &v, sizeof(v)) != sizeof(v))
 					v = 0;
-				(e.kind == 0 ? *instructions : e.kind == 1 ? *cycles : *branch_misses) += v;
+				if (e.kind == 0)
+					*instructions += v;
+				else if (e.kind == 1)
+					*cycles += v;
+				else
+					*branch_misses += v;
 			}
 		}
 
@@ -671,7 +694,13 @@ namespace
 				return;
 			int kind = 1;
 			if (type == PERF_TYPE_HARDWARE)
-				kind = (config & 0xffffffff) == PERF_COUNT_HW_INSTRUCTIONS ? 0 : (config & 0xffffffff) == PERF_COUNT_HW_BRANCH_MISSES ? 2 : 1;
+			{
+				const u64 generic = config & 0xffffffff;
+				if (generic == PERF_COUNT_HW_INSTRUCTIONS)
+					kind = 0;
+				else if (generic == PERF_COUNT_HW_BRANCH_MISSES)
+					kind = 2;
+			}
 			else if (config == 0x8c)
 				kind = 0;
 			m_events.push_back({fd, kind});
@@ -787,6 +816,200 @@ TEST_F(Spu2Mixer, DISABLED_InstructionsPerMix)
 		BenchMix(sh.name, "current", *snap, CurrentSpu2Mix, pmu);
 		BenchMix(sh.name, "reference", *snap, ReferenceSpu2Mix, pmu);
 	}
+}
+
+// The same count with the data cache emptied between mixes, which is closer to what the IOP thread sees: it runs the IOP
+// recompiler's blocks, the counters and the event tests between two mixes, and the mixer's own state (about 15 KB of voice
+// structures, a line of SPU2 RAM per voice, the reverb's working addresses) is not in the first-level cache when it starts.
+// Each mix is followed by reading POLLUTE bytes of unrelated memory; the cost of that reading is measured on its own and
+// subtracted. Prints the difference per mix. Disabled by default:
+//   spu2_tests --gtest_also_run_disabled_tests --gtest_filter='*DISABLED_ColdCache*'
+TEST_F(Spu2Mixer, DISABLED_ColdCache)
+{
+	Pmu pmu;
+	ASSERT_TRUE(pmu.Ok()) << "perf_event_open failed";
+	const char* kb_env = std::getenv("SPU2_TEST_POLLUTE_KB");
+	const size_t pollute = (kb_env ? std::strtoul(kb_env, nullptr, 10) : 256) * 1024;
+	struct Shape
+	{
+		const char* name;
+		u32 a0, a1;
+	};
+	std::vector<u8> junk(16 << 20, 1);
+	for (const Shape sh : {Shape{"busy", 20, 20}, Shape{"mixed", 15, 7}, Shape{"quiet", 0, 2}})
+	{
+		Rng r(4242);
+		ShapeState(r, sh.a0, sh.a1);
+		auto snap = std::make_unique<Snapshot>();
+		snap->Take();
+		const u32 warm = 400, n = 4000;
+		std::vector<StereoOut32> out;
+		out.reserve(warm + n + 8);
+		auto sweep = [&](size_t& at) {
+			u32 sum = 0;
+			for (size_t b = 0; b < pollute; b += 64)
+				sum += junk[(at + b) % junk.size()];
+			at = (at + pollute) % junk.size();
+			return sum;
+		};
+		volatile u32 sink = 0;
+		double warm_instr = 0, warm_cyc = 0, cold_instr = 0, cold_cyc = 0;
+		for (int pass = 0; pass < 3; pass++)
+		{
+			// 0: mix only (warm), 1: pollution only, 2: mix then pollution.
+			snap->Restore();
+			out.clear();
+			s_capture = &out;
+			size_t at = 0;
+			for (u32 i = 0; i < warm; i++)
+			{
+				Cycles++;
+				if (pass != 1)
+					CurrentSpu2Mix();
+				if (pass != 0)
+					sink = sink + sweep(at);
+			}
+			u64 instr = 0, cyc = 0, bm = 0;
+			pmu.Start();
+			for (u32 i = 0; i < n; i++)
+			{
+				Cycles++;
+				if (pass != 1)
+					CurrentSpu2Mix();
+				if (pass != 0)
+					sink = sink + sweep(at);
+			}
+			pmu.Stop(&instr, &cyc, &bm);
+			s_capture = nullptr;
+			static double pollute_instr, pollute_cyc;
+			if (pass == 0)
+			{
+				warm_instr = static_cast<double>(instr) / n;
+				warm_cyc = static_cast<double>(cyc) / n;
+			}
+			else if (pass == 1)
+			{
+				pollute_instr = static_cast<double>(instr) / n;
+				pollute_cyc = static_cast<double>(cyc) / n;
+			}
+			else
+			{
+				cold_instr = static_cast<double>(instr) / n - pollute_instr;
+				cold_cyc = static_cast<double>(cyc) / n - pollute_cyc;
+			}
+		}
+		std::printf("COLD shape=%s pollute_kb=%zu warm: instructions_per_mix=%.0f cycles_per_mix=%.0f | cold: instructions_per_mix=%.0f cycles_per_mix=%.0f (+%.0f%%)\n", sh.name,
+			pollute / 1024, warm_instr, warm_cyc, cold_instr, cold_cyc, 100.0 * (cold_cyc - warm_cyc) / warm_cyc);
+	}
+}
+
+// Writes the three game-shaped states (busy, mixed, quiet) to $SPU2_TEST_SNAPSHOT_DIR/<shape>.snap, for tools/devlib_bench, which
+// runs the spu2Mix of a device build of libemucore on them. The file is: a header of four u32 (magic 'SPU2', sizeof(Cores),
+// pcm cache entries, sizeof(PcmCacheEntry)), the bytes of Cores with each voice's SBuffer turned into a byte offset into the
+// decoded-block cache (-1 for null), SPU2 RAM (4 MB), the decoded-block cache, then Spdif (14 bytes), OutPos, InputPos (u16),
+// Cycles (u32), PlayMode (s32), and last the expected result: a hash of SPU2 RAM below 0x2800 and OutPos after 100 mixes
+// by the frozen reference mixer, so that the tool can tell its mixer computes the same thing.
+// Disabled by default:
+//   SPU2_TEST_SNAPSHOT_DIR=/path spu2_tests --gtest_also_run_disabled_tests --gtest_filter='*DISABLED_DumpSnapshots*'
+TEST_F(Spu2Mixer, DISABLED_DumpSnapshots)
+{
+	const char* dir = std::getenv("SPU2_TEST_SNAPSHOT_DIR");
+	ASSERT_NE(dir, nullptr);
+	struct Shape
+	{
+		const char* name;
+		u32 a0, a1;
+	};
+	for (const Shape sh : {Shape{"busy", 20, 20}, Shape{"mixed", 15, 7}, Shape{"quiet", 0, 2}})
+	{
+		Rng r(4242);
+		ShapeState(r, sh.a0, sh.a1);
+		auto snap = std::make_unique<Snapshot>();
+		snap->Take();
+
+		std::vector<StereoOut32> out;
+		out.reserve(128);
+		snap->Restore();
+		s_capture = &out;
+		for (int i = 0; i < 100; i++)
+		{
+			Cycles++;
+			ReferenceSpu2Mix();
+		}
+		s_capture = nullptr;
+		const u64 expect = Hash(_spu2mem, 0x2800 * sizeof(s16), Hash(&OutPos, sizeof(OutPos)));
+		snap->Restore();
+
+		std::vector<u8> cores(sizeof(Cores));
+		std::memcpy(cores.data(), Cores, sizeof(Cores));
+		for (int c = 0; c < 2; c++)
+		{
+			for (u32 v = 0; v < V_Core::NumVoices; v++)
+			{
+				const V_Voice& vc = Cores[c].Voices[v];
+				const size_t field = reinterpret_cast<const u8*>(&vc.SBuffer) - reinterpret_cast<const u8*>(Cores);
+				const s64 off = vc.SBuffer ? (reinterpret_cast<const u8*>(vc.SBuffer) - reinterpret_cast<const u8*>(pcm_cache_data)) : -1;
+				std::memcpy(cores.data() + field, &off, sizeof(off));
+			}
+		}
+		char path[512];
+		std::snprintf(path, sizeof(path), "%s/%s.snap", dir, sh.name);
+		std::FILE* f = std::fopen(path, "wb");
+		ASSERT_NE(f, nullptr) << path;
+		const u32 header[4] = {0x32555053u, static_cast<u32>(sizeof(Cores)), static_cast<u32>(pcm_BlockCount), static_cast<u32>(sizeof(PcmCacheEntry))};
+		std::fwrite(header, sizeof(header), 1, f);
+		std::fwrite(cores.data(), cores.size(), 1, f);
+		std::fwrite(_spu2mem, sizeof(_spu2mem), 1, f);
+		std::fwrite(pcm_cache_data, sizeof(PcmCacheEntry), pcm_BlockCount, f);
+		std::fwrite(&Spdif, sizeof(Spdif), 1, f);
+		std::fwrite(&OutPos, sizeof(OutPos), 1, f);
+		std::fwrite(&InputPos, sizeof(InputPos), 1, f);
+		std::fwrite(&Cycles, sizeof(Cycles), 1, f);
+		std::fwrite(&PlayMode, sizeof(PlayMode), 1, f);
+		std::fwrite(&expect, sizeof(expect), 1, f);
+		std::fclose(f);
+		std::printf("SNAPSHOT %s sizeof(Cores)=%zu sizeof(PcmCacheEntry)=%zu sizeof(V_Voice)=%zu offsetof(SBuffer)=%zu expected hash %016llx\n", path, sizeof(Cores),
+			sizeof(PcmCacheEntry), sizeof(V_Voice), offsetof(V_Voice, SBuffer), static_cast<unsigned long long>(expect));
+	}
+}
+
+// A driver for `valgrind --tool=cachegrind`, to count the data cache misses of one spu2Mix() under a small cache. On a device
+// the IOP thread runs other code between two mixes (the IOP recompiler's blocks, the counters, the event tests), which evicts
+// part of what the mixer used last time; SPU2_TEST_POLLUTE_KB is how much other memory is read between two mixes to stand in
+// for it, so 0 is the mixer with a cache to itself and a value at or above the cache size is the mixer starting cold.
+// Disabled by default:
+//   SPU2_TEST_POLLUTE_KB=64 valgrind --tool=cachegrind --D1=32768,4,64 --LL=262144,8,64 spu2_tests --gtest_also_run_disabled_tests --gtest_filter='*DISABLED_CacheModelDriver*'
+TEST_F(Spu2Mixer, DISABLED_CacheModelDriver)
+{
+	const char* kb_env = std::getenv("SPU2_TEST_POLLUTE_KB");
+	const size_t pollute_bytes = (kb_env ? std::strtoul(kb_env, nullptr, 10) : 0) * 1024;
+	const char* mixes_env = std::getenv("SPU2_TEST_MIXES");
+	const u32 mixes = mixes_env ? static_cast<u32>(std::strtoul(mixes_env, nullptr, 10)) : 1500;
+
+	Rng r(4242);
+	ShapeState(r, 15, 7);
+	auto snap = std::make_unique<Snapshot>();
+	snap->Take();
+	snap->Restore();
+
+	std::vector<StereoOut32> out;
+	out.reserve(mixes + 8);
+	s_capture = &out;
+	std::vector<u8> junk(8 << 20, 1);
+	size_t at = 0;
+	volatile u32 sink = 0;
+	for (u32 i = 0; i < mixes; i++)
+	{
+		Cycles++;
+		CurrentSpu2Mix();
+		u32 sum = 0;
+		for (size_t b = 0; b < pollute_bytes; b += 64)
+			sum += junk[(at + b) % junk.size()];
+		at = (at + pollute_bytes) % junk.size();
+		sink = sink + sum;
+	}
+	s_capture = nullptr;
+	std::printf("CACHEMODEL mixes=%u pollute_kb=%zu\n", mixes, pollute_bytes / 1024);
 }
 
 #endif // SPU2_TEST_HAS_PMU
