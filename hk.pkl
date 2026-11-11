@@ -1,0 +1,33 @@
+amends "package://github.com/jdx/hk/releases/download/v2.12.0/hk@2.12.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v2.12.0/hk@2.12.0#/Builtins.pkl"
+
+// Detached fork with a large legacy C++ tree: hygiene only, scoped to CI and test scripts.
+local scope = List("tests/**", ".github/**", "mise.toml", "hk.pkl")
+
+local linters = new Mapping<String, Step> {
+  ["check-merge-conflict"] = (Builtins.check_merge_conflict) { glob = scope }
+  ["detect-private-key"] = (Builtins.detect_private_key) { glob = scope }
+  ["actionlint"] = (Builtins.actionlint) { glob = List(".github/workflows/*.yml") }
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = linters
+  }
+  ["commit-msg"] {
+    steps {
+      ["conventional-commit"] {
+        check = "hk util check-conventional-commit {{commit_msg_file}}"
+      }
+    }
+  }
+  ["check"] {
+    steps = linters
+  }
+  ["fix"] {
+    fix = true
+    steps = linters
+  }
+}
